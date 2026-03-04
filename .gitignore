@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+.env
+.envrc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+.cache/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs & runs
+*.log
+wandb/
+lightning_logs/
+
+# Data you can regenerate
+data/checkpoints/
+data/opponent_pool/
+data/replays/
+data/videos/
+!data/.gitkeep
+
+# --- Editors ---
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json 
+!.vscode/extensions.json
+
+# --- Custom ---
+replays/

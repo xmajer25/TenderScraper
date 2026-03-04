@@ -1,0 +1,15 @@
+services:
+  api:
+    volumes:
+      - tender_data:/app/data
+
+  scraper:
+    volumes:
+      - tender_data:/app/data
+
+  scraper-cron:
+    volumes:
+      - tender_data:/app/data
+
+volumes:
+  tender_data:

@@ -1,0 +1,40 @@
+services:
+  api:
+    build:
+      context: .
+    image: tenderscraper:local
+    command: ["uvicorn", "tenderscraper.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  scraper:
+    image: tenderscraper:local
+    profiles: ["tools"]
+    command: ["/app/docker/run-scraper.sh"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: "no"
+
+  scraper-cron:
+    image: tenderscraper:local
+    profiles: ["cron"]
+    user: root
+    command: ["/app/docker/start-cron.sh"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
