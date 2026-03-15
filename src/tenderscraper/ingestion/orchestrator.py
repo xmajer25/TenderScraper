@@ -1,51 +1,39 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
 
 from tenderscraper.connectors.base import TenderNotice
-from tenderscraper.storage.layout import normalized_dir, raw_dir, tender_root
-from tenderscraper.downloader.tender_arena import download_tender_arena_docs
+from tenderscraper.db import create_db_and_tables
 from tenderscraper.downloader.poptavej import download_poptavej_docs
+from tenderscraper.downloader.tender_arena import download_tender_arena_docs
+from tenderscraper.repository import get_tender_meta, upsert_tender_meta
 
-def write_tender(tenders_dir: Path, tender: TenderNotice) -> Path:
-    tdir = tender_root(tenders_dir, source=tender.source, tender_key=tender.tender_key)
-    rdir = raw_dir(tenders_dir, source=tender.source, tender_key=tender.tender_key)
-    ndir = normalized_dir(tenders_dir, source=tender.source, tender_key=tender.tender_key)
+TenderRef = Tuple[str, str]
 
-    rdir.mkdir(parents=True, exist_ok=True)
-    ndir.mkdir(parents=True, exist_ok=True)
 
+def write_tender(tender: TenderNotice) -> TenderRef:
     meta = tender.model_dump(mode="json")
     meta["_ingested_at"] = datetime.now(timezone.utc).isoformat()
-    meta_path = tdir / "meta.json"
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    create_db_and_tables()
+    upsert_tender_meta(meta)
+    return (tender.source, tender.tender_key)
 
-    return tdir
 
-
-def ingest_all(*, tenders_dir: Path, tenders: Iterable[TenderNotice]) -> List[Path]:
-    out: List[Path] = []
-    for t in tenders:
-        out.append(write_tender(tenders_dir, t))
+def ingest_all(*, tenders: Iterable[TenderNotice]) -> List[TenderRef]:
+    out: List[TenderRef] = []
+    for tender in tenders:
+        out.append(write_tender(tender))
     return out
 
-def download_docs_for_ingested_tenders(tender_dirs: List[Path]) -> None:
-    for tdir in tender_dirs:
-        meta_path = tdir / "meta.json"
-        if not meta_path.exists():
-            continue
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
+
+def download_docs_for_ingested_tenders(tender_refs: List[TenderRef]) -> None:
+    for source, tender_id in tender_refs:
+        meta = get_tender_meta(source, tender_id)
+        if not meta:
             continue
 
-        src = meta.get("source")
-
-        if src == "tender_arena":
-            download_tender_arena_docs(meta_path=meta_path)
-
-        elif src == "poptavej":
-            download_poptavej_docs(meta_path=meta_path)
+        if source == "tender_arena":
+            download_tender_arena_docs(meta=meta)
+        elif source == "poptavej":
+            download_poptavej_docs(meta=meta)

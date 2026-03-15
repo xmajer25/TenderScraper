@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 from tenderscraper.connectors.base import BaseConnector, TenderDocument, TenderNotice
 from tenderscraper.scraping.sources.tender_arena import TenderArenaScraper
+
+logger = logging.getLogger(__name__)
 
 
 class TenderArenaConnector(BaseConnector):
@@ -10,11 +14,20 @@ class TenderArenaConnector(BaseConnector):
     def fetch(self, *, query: str | None = None, limit: int = 10):
         scraper = TenderArenaScraper()
 
-        urls = scraper.fetch_tender_urls(limit=limit, headless=True, timeout_ms=30_000)
+        try:
+            urls = scraper.fetch_tender_urls(limit=limit, headless=True, timeout_ms=30_000)
+        except Exception as exc:
+            logger.warning("TenderArena listing fetch failed: %s", exc)
+            return []
+
         tenders: list[TenderNotice] = []
 
         for url in urls:
-            detail = scraper.fetch_detail(url=url, headless=True, include_docs=True)
+            try:
+                detail = scraper.fetch_detail(url=url, headless=True, include_docs=True)
+            except Exception as exc:
+                logger.warning("TenderArena detail fetch failed for %s: %s", url, exc)
+                continue
 
             source_id = url.rstrip("/").split("/")[-1]
             title = detail.title or "Unknown title"

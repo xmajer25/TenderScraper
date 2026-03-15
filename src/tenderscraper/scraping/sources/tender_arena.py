@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
 
+from playwright.sync_api import TimeoutError as PWTimeoutError
 from playwright.sync_api import sync_playwright
 
 from tenderscraper.scraping.datetime_cz import parse_cz_datetime
@@ -36,13 +37,39 @@ class TenderArenaScraper:
     START_URL = "https://tenderarena.cz/dodavatel"
 
     ROWS_XPATH = "//*[@id='zakazky']//app-seznam//section/a"
+    ROWS_XPATH_FALLBACK = "//*[@id='zakazky']//section//a[@href]"
     NEXT_XPATH = "//*[@id='zakazky']//a[.//p[normalize-space()='Další']]"
 
     DOC_ROW_XPATH = "//*[@id='seznam-dokumentu']//app-dokument/section"
-    DOC_INFO_BTN_REL_XPATH = ".//button[1]"
-    DOC_DOWNLOAD_BTN_REL_XPATH = ".//button[2]"
-
     DOC_MODAL_XPATH = "//*[@id='detail-dokumentu-modalni-panel']"
+
+    def _listing_locator(self, page):
+        primary = page.locator(f"xpath={self.ROWS_XPATH}")
+        try:
+            if primary.count() > 0:
+                return primary
+        except Exception:
+            pass
+        return page.locator(f"xpath={self.ROWS_XPATH_FALLBACK}")
+
+    def _wait_for_listing_ready(self, page, *, timeout_ms: int) -> bool:
+        deadline = datetime.now().timestamp() + (timeout_ms / 1000)
+        while datetime.now().timestamp() < deadline:
+            dismiss_common_overlays(page)
+            try:
+                page.wait_for_load_state("networkidle", timeout=2_000)
+            except Exception:
+                pass
+
+            anchors = self._listing_locator(page)
+            try:
+                if anchors.count() > 0:
+                    return True
+            except Exception:
+                pass
+
+            page.wait_for_timeout(500)
+        return False
 
     def fetch_tender_urls(self, *, limit: int, headless: bool, timeout_ms: int) -> List[str]:
         urls: List[str] = []
@@ -53,17 +80,18 @@ class TenderArenaScraper:
 
             try:
                 page.goto(self.START_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-                page.wait_for_selector(f"xpath={self.ROWS_XPATH}", timeout=timeout_ms)
+                page.wait_for_timeout(1_000)
+                if not self._wait_for_listing_ready(page, timeout_ms=timeout_ms):
+                    return []
 
                 while len(urls) < limit:
-                    anchors = page.locator(f"xpath={self.ROWS_XPATH}")
+                    anchors = self._listing_locator(page)
 
-                    # collect current page urls
                     for i in range(anchors.count()):
                         if len(urls) >= limit:
                             break
-                        a = anchors.nth(i)
-                        href = a.get_attribute("href") or ""
+                        anchor = anchors.nth(i)
+                        href = anchor.get_attribute("href") or ""
                         full = href if href.startswith("http") else f"{self.BASE}{href}"
                         if full and full not in urls:
                             urls.append(full)
@@ -75,7 +103,6 @@ class TenderArenaScraper:
                     if next_btn.count() == 0:
                         break
 
-                    # Snapshot first row href to detect page change
                     before_first = None
                     try:
                         if anchors.count() > 0:
@@ -85,11 +112,10 @@ class TenderArenaScraper:
 
                     dismiss_common_overlays(page)
                     try:
-                        next_btn.scroll_into_view_if_needed(timeout=2000)
+                        next_btn.scroll_into_view_if_needed(timeout=2_000)
                     except Exception:
                         pass
 
-                    # Try click; if intercepted, force click
                     clicked = False
                     try:
                         next_btn.click(timeout=5_000)
@@ -105,17 +131,15 @@ class TenderArenaScraper:
                     if not clicked:
                         break
 
-                    # Wait up to 8s for the list to actually change; otherwise stop to avoid hanging forever
                     changed = False
-                    for _ in range(32):  # 32 * 250ms = 8s
+                    for _ in range(32):
                         page.wait_for_timeout(250)
                         try:
-                            now_anchors = page.locator(f"xpath={self.ROWS_XPATH}")
+                            now_anchors = self._listing_locator(page)
                             if now_anchors.count() == 0:
                                 continue
                             now_first = now_anchors.nth(0).get_attribute("href")
                             if before_first is None:
-                                # no baseline -> accept that rows exist
                                 changed = True
                                 break
                             if now_first and now_first != before_first:
@@ -127,8 +151,11 @@ class TenderArenaScraper:
                     if not changed:
                         break
 
-                    page.wait_for_selector(f"xpath={self.ROWS_XPATH}", timeout=timeout_ms)
+                    if not self._wait_for_listing_ready(page, timeout_ms=timeout_ms):
+                        break
 
+            except PWTimeoutError:
+                return []
             finally:
                 browser.close()
 
@@ -197,13 +224,13 @@ class TenderArenaScraper:
                 dismiss_common_overlays(page)
 
                 try:
-                    info_btn.click(trial=True, timeout=2000)
-                    info_btn.click(timeout=5000)
+                    info_btn.click(trial=True, timeout=2_000)
+                    info_btn.click(timeout=5_000)
                 except Exception:
                     dismiss_common_overlays(page)
-                    info_btn.click(timeout=5000, force=True)
+                    info_btn.click(timeout=5_000, force=True)
 
-                page.wait_for_selector("xpath=//*[@id='detail-dokumentu-modalni-panel']", timeout=timeout_ms)
+                page.wait_for_selector(f"xpath={self.DOC_MODAL_XPATH}", timeout=timeout_ms)
 
                 display_name = get_value_by_label(page, "Název dokumentu")
                 category = get_value_by_label(page, "Kategorie dokumentu")
@@ -221,14 +248,14 @@ class TenderArenaScraper:
                     )
                 )
 
-                modal = page.locator("xpath=//*[@id='detail-dokumentu-modalni-panel']").first
+                modal = page.locator(f"xpath={self.DOC_MODAL_XPATH}").first
 
                 close_btn = modal.get_by_role("button", name="Zavřít")
                 if close_btn.count() == 0:
                     close_btn = modal.get_by_role("button", name="Close")
 
                 if close_btn.count() > 0:
-                    close_btn.first.click(timeout=2000)
+                    close_btn.first.click(timeout=2_000)
                 else:
                     page.keyboard.press("Escape")
 
@@ -236,15 +263,15 @@ class TenderArenaScraper:
 
                 overlay = page.locator(".modal-overlay").first
                 try:
-                    overlay.wait_for(state="hidden", timeout=3000)
+                    overlay.wait_for(state="hidden", timeout=3_000)
                 except Exception:
                     try:
-                        overlay.click(force=True, timeout=1000)
+                        overlay.click(force=True, timeout=1_000)
                     except Exception:
                         pass
 
                 try:
-                    modal.wait_for(state="hidden", timeout=3000)
+                    modal.wait_for(state="hidden", timeout=3_000)
                 except Exception:
                     pass
 

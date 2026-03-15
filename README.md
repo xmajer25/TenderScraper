@@ -1,95 +1,138 @@
 # TenderScraper
 
-## Docker quick start
+Tender metadata is stored in Postgres. Attachment files are stored in S3-compatible object storage. The runtime does not depend on `data/tenders`.
 
-1. Copy env template:
-   ```bash
-   cp .env.example .env
-   ```
-2. Fill `.env` (at least `POPTAVEJ_USERNAME` and `POPTAVEJ_PASSWORD` if you use `poptavej` source).
-3. Start API:
-   ```bash
-   docker compose up --build
-   ```
-4. Open API docs:
-   - http://localhost:8000/docs
-   - healthcheck: http://localhost:8000/health
+Postgres can technically store binary files, but that is the wrong default here. `.pdf`, `.docx`, `.xlsx`, and similar raw tender files should live in object storage, while Postgres keeps searchable metadata and document references.
 
-## Run scraper manually (one run, exits)
+## Local Docker
 
-Build image once, then:
+Create env file:
+
+```bash
+cp .env.example .env
+```
+
+Start API + Postgres:
+
+```bash
+docker compose up --build
+```
+
+Services:
+- API: http://localhost:8000
+- Swagger UI: http://localhost:8000/docs
+- Health: http://localhost:8000/health
+- Postgres: `localhost:5432`
+
+Local defaults:
+- metadata DB: Postgres in Docker
+- files: uploaded to object storage
+- any local files are temporary scratch files under `SCRATCH_DIR`
+
+## Run scraper once
 
 ```bash
 docker compose --profile tools run --rm scraper
 ```
 
-This runs `/app/docker/run-scraper.sh`, which executes:
-- `tenderscraper ingest --source <source> --limit <n> [--download-docs]`
-
-Sources and behavior are controlled with env vars:
-- `SCRAPER_SOURCES` (comma-separated, default `tender_arena,poptavej`)
-- `SCRAPER_LIMIT` (default `50`)
-- `SCRAPER_DOWNLOAD_DOCS` (`true`/`false`, default `true`)
-
-## Optional cron scheduler container
-
-Enable scheduler profile:
-
-```bash
-docker compose --profile cron up -d scraper-cron
-```
-
-Default schedule (twice daily):
-- `SCRAPER_CRON=0 6,18 * * *`
-
-Other examples:
-- `0 */12 * * *` (every 12 hours)
-- `30 2,14 * * *` (02:30 and 14:30 daily)
-
-Run a single source ad hoc:
+Ad hoc example:
 
 ```bash
 docker compose --profile tools run --rm -e SCRAPER_SOURCES=ted -e SCRAPER_LIMIT=1 -e SCRAPER_DOWNLOAD_DOCS=false scraper
 ```
 
-## Data persistence
-
-In local compose (`docker-compose.yml`):
-- host `./data` is mounted to container `/app/data`
-- metadata JSON and downloaded attachments are both persisted there
-
-Structure:
-- `./data/tenders/source=<source>/tender=<id>/meta.json`
-- `./data/tenders/source=<source>/tender=<id>/raw/*`
-- `./data/auth/poptavej_state.json`
-
-## Prod-like compose override
-
-Use named volume (no bind mount):
+## Optional local cron container
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+docker compose --profile cron up -d scraper-cron
 ```
 
-This stores data in Docker volume `tender_data`.
+Default schedule:
 
-## Required env vars
+```text
+0 6,18 * * *
+```
 
-- `POPTAVEJ_USERNAME` (required for authenticated poptavej downloads)
-- `POPTAVEJ_PASSWORD` (required for authenticated poptavej downloads)
+Examples:
+- `0 */12 * * *`
+- `30 2,14 * * *`
 
-Optional:
-- `POPTAVEJ_STORAGE_STATE` (default `./data/auth/poptavej_state.json`)
-- `SCRAPER_SOURCES`, `SCRAPER_LIMIT`, `SCRAPER_DOWNLOAD_DOCS`, `SCRAPER_CRON`
-- `DATA_DIR`, `TENDERS_DIR`, `SQLITE_PATH`
+## Environment
 
-## VPS runbook (Docker Compose)
+Core:
+- `DATABASE_URL`
+- `SCRATCH_DIR`
+- `POSTGRES_DB`
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `POPTAVEJ_USERNAME`
+- `POPTAVEJ_PASSWORD`
 
-1. Install Docker Engine + Docker Compose plugin on the VPS.
-2. Copy project to server and create `.env` from `.env.example`.
-3. Set real credentials in `.env` and keep it out of git.
-4. Start API: `docker compose up -d --build api`.
-5. Start scheduler: `docker compose --profile cron up -d scraper-cron`.
-6. Verify API health: `curl http://localhost:8000/health`.
-7. Verify scraper logs: `docker compose logs -f scraper-cron`.
-8. Optional: switch to named volume with `-f docker-compose.prod.yml`.
+Storage:
+- `STORAGE_BACKEND=s3`
+- `S3_BUCKET`
+- `S3_REGION`
+- `S3_ENDPOINT_URL`
+- `S3_ACCESS_KEY_ID`
+- `S3_SECRET_ACCESS_KEY`
+- `S3_PUBLIC_BASE_URL`
+- `S3_PRESIGN_EXPIRY_S`
+
+Scraper:
+- `SCRAPER_SOURCES`
+- `SCRAPER_LIMIT`
+- `SCRAPER_DOWNLOAD_DOCS`
+- `SCRAPER_CRON`
+- `SCRAPER_FAIL_FAST`
+
+## Render
+
+Use:
+- Render Postgres for metadata
+- Render Web Service for the API
+- Render Cron Job for the scraper
+- External S3-compatible object storage for files
+
+Do not rely on local disk on Render for attachments. The API service and cron scraper are separate runtimes, so shared durable file access is not the right boundary.
+
+This repo includes [render.yaml](c:/Users/jakub/OneDrive/Desktop/MetaIT/TenderScraper/render.yaml) with:
+- one web service
+- one cron service
+- one Postgres database
+
+For file storage, point the S3 settings at a provider such as Cloudflare R2, AWS S3, or Backblaze B2 S3-compatible API.
+
+Recommended Render settings:
+- `STORAGE_BACKEND=s3`
+- `SCRATCH_DIR=/tmp/tenderscraper`
+
+## Verify Postgres
+
+From the app container:
+
+```bash
+docker compose exec api tenderscraper db-stats
+```
+
+From Postgres directly:
+
+```bash
+docker compose exec postgres psql -U postgres -d tenderscraper -c "select source, count(*) from tenderrecord group by source order by source;"
+```
+
+If you want to verify that the runtime is using only Postgres + object storage, run:
+
+```bash
+docker compose --profile tools run --rm scraper
+```
+
+## Validation
+
+Validated in this workspace:
+- `docker compose config`
+- `docker compose build` completed successfully before the later Docker daemon failure
+- API health and `/docs` responded successfully against the built image
+
+Not fully re-validated after the final Postgres/S3 code changes:
+- end-to-end scraper run against the updated image
+- Render deployment itself

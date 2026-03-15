@@ -4,15 +4,33 @@ set -eu
 SOURCES="${SCRAPER_SOURCES:-tender_arena,poptavej}"
 LIMIT="${SCRAPER_LIMIT:-50}"
 DOWNLOAD_DOCS="${SCRAPER_DOWNLOAD_DOCS:-true}"
+FAIL_FAST="${SCRAPER_FAIL_FAST:-false}"
+FAILURES=0
 
 OLD_IFS="$IFS"
 IFS=","
 for source in $SOURCES; do
   [ -z "$source" ] && continue
   if [ "$DOWNLOAD_DOCS" = "true" ]; then
-    tenderscraper ingest --source "$source" --limit "$LIMIT" --download-docs
+    if ! tenderscraper ingest --source "$source" --limit "$LIMIT" --download-docs; then
+      echo "Source '$source' failed" >&2
+      FAILURES=$((FAILURES + 1))
+      if [ "$FAIL_FAST" = "true" ]; then
+        exit 1
+      fi
+    fi
   else
-    tenderscraper ingest --source "$source" --limit "$LIMIT"
+    if ! tenderscraper ingest --source "$source" --limit "$LIMIT"; then
+      echo "Source '$source' failed" >&2
+      FAILURES=$((FAILURES + 1))
+      if [ "$FAIL_FAST" = "true" ]; then
+        exit 1
+      fi
+    fi
   fi
 done
 IFS="$OLD_IFS"
+
+if [ "$FAILURES" -gt 0 ]; then
+  exit 1
+fi

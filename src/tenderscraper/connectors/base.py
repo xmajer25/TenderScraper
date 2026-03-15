@@ -16,7 +16,8 @@ class TenderDocument(BaseModel):
 
     # Filled after download
     mime_type: Optional[str] = None
-    local_path: Optional[str] = None       # relative to tender folder
+    storage_key: Optional[str] = None
+    storage_url: Optional[str] = None
     size_bytes: Optional[int] = None
     sha256: Optional[str] = None
     downloaded_at: Optional[datetime] = None

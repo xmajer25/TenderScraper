@@ -7,6 +7,8 @@ from typing import Optional
 
 from playwright.sync_api import Page, TimeoutError as PWTimeoutError, sync_playwright
 
+from tenderscraper.config import settings
+
 
 @dataclass(frozen=True)
 class PoptavejAuthConfig:
@@ -39,7 +41,7 @@ class PoptavejAuthConfig:
         if state:
             state_path = Path(state)
         else:
-            state_path = Path("data") / "auth" / "poptavej_state.json"
+            state_path = settings.default_poptavej_state_path
 
         return PoptavejAuthConfig(username=user, password=pwd, storage_state_path=state_path)
 
@@ -73,6 +75,8 @@ def ensure_storage_state(
         login_and_save_state(headless=headless, timeout_ms=timeout_ms)
         return cfg.storage_state_path
 
+    needs_relogin = False
+
     # Validate existing state by opening a page with that state and checking "logged-in" signals.
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -82,16 +86,16 @@ def ensure_storage_state(
             page.goto(cfg.start_url, wait_until="domcontentloaded", timeout=timeout_ms)
             page.wait_for_timeout(300)
             if not _is_logged_in(page):
-                # state exists but isn't authenticated anymore
-                browser.close()
-                login_and_save_state(headless=headless, timeout_ms=timeout_ms)
-                return cfg.storage_state_path
+                needs_relogin = True
         finally:
             try:
                 context.close()
             except Exception:
                 pass
             browser.close()
+
+    if needs_relogin:
+        login_and_save_state(headless=headless, timeout_ms=timeout_ms)
 
     return cfg.storage_state_path
 

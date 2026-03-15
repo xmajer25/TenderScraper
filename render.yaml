@@ -1,0 +1,77 @@
+services:
+  - type: web
+    name: tenderscraper-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: uvicorn tenderscraper.api.app:app --host 0.0.0.0 --port 8000
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tenderscraper-db
+          property: connectionString
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: SCRATCH_DIR
+        value: /tmp/tenderscraper
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_PUBLIC_BASE_URL
+        sync: false
+      - key: POPTAVEJ_USERNAME
+        sync: false
+      - key: POPTAVEJ_PASSWORD
+        sync: false
+
+  - type: cron
+    name: tenderscraper-scraper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: /app/docker/run-scraper.sh
+    schedule: "0 6,18 * * *"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tenderscraper-db
+          property: connectionString
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: SCRATCH_DIR
+        value: /tmp/tenderscraper
+      - key: SCRAPER_SOURCES
+        value: tender_arena,poptavej
+      - key: SCRAPER_LIMIT
+        value: 50
+      - key: SCRAPER_DOWNLOAD_DOCS
+        value: true
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_PUBLIC_BASE_URL
+        sync: false
+      - key: POPTAVEJ_USERNAME
+        sync: false
+      - key: POPTAVEJ_PASSWORD
+        sync: false
+
+databases:
+  - name: tenderscraper-db
+    databaseName: tenderscraper
+    user: tenderscraper
