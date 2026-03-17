@@ -15,14 +15,13 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
-    database_url: str = Field(
-        default="postgresql+psycopg://postgres:postgres@postgres:5432/tenderscraper",
-        validation_alias="DATABASE_URL",
-    )
+    database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")
     scratch_dir: Path = Field(
         default=Path(tempfile.gettempdir()) / "tenderscraper",
         validation_alias="SCRATCH_DIR",
     )
+    render: str | None = Field(default=None, validation_alias="RENDER")
+    render_service_name: str | None = Field(default=None, validation_alias="RENDER_SERVICE_NAME")
 
     http_timeout_s: int = 30
     http_user_agent: str = "MetaIT-TenderScraper/0.1.0"
@@ -45,8 +44,22 @@ class Settings(BaseSettings):
         return self.scratch_dir / "auth" / "poptavej_state.json"
 
     @property
+    def running_on_render(self) -> bool:
+        return bool((self.render or "").strip() or (self.render_service_name or "").strip())
+
+    @property
     def normalized_database_url(self) -> str:
-        url = self.database_url.strip()
+        url = (self.database_url or "").strip()
+        if not url:
+            raise ValueError(
+                "DATABASE_URL is required. Use the local Docker Postgres URL in .env for local runs, "
+                "or wire DATABASE_URL from the Render Postgres instance when deploying to Render."
+            )
+        if self.running_on_render and "@postgres:" in url:
+            raise ValueError(
+                "DATABASE_URL points to the Docker Compose host 'postgres', which does not exist on Render. "
+                "Set DATABASE_URL from the Render Postgres instance."
+            )
         if url.startswith("postgres://"):
             return "postgresql+psycopg://" + url[len("postgres://") :]
         if url.startswith("postgresql://") and not url.startswith("postgresql+psycopg://"):

@@ -100,6 +100,27 @@ This repo includes [render.yaml](c:/Users/jakub/OneDrive/Desktop/MetaIT/TenderSc
 - one cron service
 - one Postgres database
 
+Preferred deploy path:
+- Create the stack from the repo as a Blueprint. Render will read [render.yaml](c:/Users/jakub/OneDrive/Desktop/MetaIT/TenderScraper/render.yaml) and create all 3 resources together: `tenderscraper-db`, `tenderscraper-api`, and `tenderscraper-scraper`.
+- If you create only a single Web Service manually in the Render Dashboard, `render.yaml` is not applied to that service automatically.
+
+Manual Render setup if you do not use Blueprint:
+1. Create a Postgres database named `tenderscraper-db`.
+2. Create a Web Service from this repo using the `Dockerfile`.
+3. Create a Cron Job from this repo using the same `Dockerfile`.
+
+Manual service settings:
+- Web Service start command: `sh -c "uvicorn tenderscraper.api.app:app --host 0.0.0.0 --port ${PORT:-8000}"`
+- Cron Job start command: `/app/docker/run-scraper.sh`
+- Web Service `DATABASE_URL`: set it to the Postgres Internal Database URL from `tenderscraper-db`
+- Cron Job `DATABASE_URL`: set it to the same Postgres Internal Database URL
+- Web Service and Cron Job both need the same S3 settings and any source credentials such as `POPTAVEJ_USERNAME` and `POPTAVEJ_PASSWORD`
+- Cron Job also needs its scraper settings such as `SCRAPER_SOURCES`, `SCRAPER_LIMIT`, and `SCRAPER_DOWNLOAD_DOCS`
+
+Important:
+- Do not set `DATABASE_URL` on Render to `postgresql+psycopg://postgres:postgres@postgres:5432/tenderscraper`. That hostname only works inside local Docker Compose.
+- The API and cron job are separate Render runtimes. They do not share durable local files, so attachments must go to S3-compatible storage.
+
 For file storage, point the S3 settings at a provider such as Cloudflare R2, AWS S3, or Backblaze B2 S3-compatible API.
 
 Recommended Render settings:
