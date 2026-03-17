@@ -48,6 +48,8 @@ services:
     restart: unless-stopped
 
   scraper:
+    build:
+      context: .
     image: tenderscraper:local
     profiles: ["tools"]
     command: ["/app/docker/run-scraper.sh"]
@@ -70,6 +72,8 @@ services:
     restart: "no"
 
   scraper-cron:
+    build:
+      context: .
     image: tenderscraper:local
     profiles: ["cron"]
     user: root

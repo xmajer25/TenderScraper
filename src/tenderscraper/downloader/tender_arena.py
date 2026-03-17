@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,28 @@ from tenderscraper.storage.object_store import persist_downloaded_file
 
 DOC_ROW_XPATH = "//*[@id='seznam-dokumentu']//app-dokument/section"
 DOC_MODAL_XPATH = "//*[@id='detail-dokumentu-modalni-panel']"
+DETAIL_BUTTON_RE = re.compile(r"zobrazit|detail", re.IGNORECASE)
+DOWNLOAD_BUTTON_RE = re.compile(r"stahnout|download", re.IGNORECASE)
+CLOSE_BUTTON_RE = re.compile(r"zavrit|close", re.IGNORECASE)
+
+
+def _button_by_name(scope, pattern: re.Pattern[str]):
+    buttons = scope.locator("button")
+    for i in range(buttons.count()):
+        button = buttons.nth(i)
+        try:
+            title = (button.get_attribute("title") or "").strip()
+        except Exception:
+            title = ""
+        if title and pattern.search(title):
+            return button
+        try:
+            text = (button.inner_text() or "").strip()
+        except Exception:
+            text = ""
+        if text and pattern.search(text):
+            return button
+    return None
 
 
 def _wait_clickable(locator, *, timeout_ms: int = 15_000) -> None:
@@ -76,8 +99,8 @@ def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
             for i in range(doc_sections.count()):
                 section = doc_sections.nth(i)
 
-                info_btn = section.locator("button[title='Zobrazit detail']").first
-                if info_btn.count() == 0:
+                info_btn = _button_by_name(section, DETAIL_BUTTON_RE)
+                if info_btn is None or info_btn.count() == 0:
                     continue
 
                 dismiss_common_overlays(page)
@@ -88,15 +111,13 @@ def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
                     info_btn.click(timeout=5_000, force=True)
 
                 page.wait_for_selector(f"xpath={DOC_MODAL_XPATH}", timeout=30_000)
-                canonical = get_value_by_label(page, "Název souboru")
+                canonical = get_value_by_label(page, "nazev souboru")
                 canonical = canonical.strip() if canonical else None
 
                 modal = page.locator(f"xpath={DOC_MODAL_XPATH}").first
-                close_btn = modal.get_by_role("button", name="Zavřít")
-                if close_btn.count() == 0:
-                    close_btn = modal.get_by_role("button", name="Close")
-                if close_btn.count() > 0:
-                    close_btn.first.click(timeout=2_000)
+                close_btn = _button_by_name(modal, CLOSE_BUTTON_RE)
+                if close_btn is not None and close_btn.count() > 0:
+                    close_btn.click(timeout=2_000)
                 else:
                     page.keyboard.press("Escape")
 
@@ -112,8 +133,8 @@ def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
                 if document.get("storage_key") and document.get("sha256"):
                     continue
 
-                dl_btn = section.locator("button[title='Stáhnout']").first
-                if dl_btn.count() == 0:
+                dl_btn = _button_by_name(section, DOWNLOAD_BUTTON_RE)
+                if dl_btn is None or dl_btn.count() == 0:
                     continue
 
                 dismiss_common_overlays(page)

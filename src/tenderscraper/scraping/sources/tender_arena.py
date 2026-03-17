@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Optional
@@ -38,10 +39,13 @@ class TenderArenaScraper:
 
     ROWS_XPATH = "//*[@id='zakazky']//app-seznam//section/a"
     ROWS_XPATH_FALLBACK = "//*[@id='zakazky']//section//a[@href]"
-    NEXT_XPATH = "//*[@id='zakazky']//a[.//p[normalize-space()='Další']]"
+    NEXT_XPATH = "//*[@id='zakazky']//a[.//p[contains(normalize-space(), 'Dal')]]"
 
     DOC_ROW_XPATH = "//*[@id='seznam-dokumentu']//app-dokument/section"
     DOC_MODAL_XPATH = "//*[@id='detail-dokumentu-modalni-panel']"
+
+    _DETAIL_BUTTON_RE = re.compile(r"zobrazit|detail", re.IGNORECASE)
+    _CLOSE_BUTTON_RE = re.compile(r"zavrit|close", re.IGNORECASE)
 
     def _listing_locator(self, page):
         primary = page.locator(f"xpath={self.ROWS_XPATH}")
@@ -51,6 +55,24 @@ class TenderArenaScraper:
         except Exception:
             pass
         return page.locator(f"xpath={self.ROWS_XPATH_FALLBACK}")
+
+    def _button_by_name(self, scope, pattern: re.Pattern[str]):
+        buttons = scope.locator("button")
+        for i in range(buttons.count()):
+            button = buttons.nth(i)
+            try:
+                title = (button.get_attribute("title") or "").strip()
+            except Exception:
+                title = ""
+            if title and pattern.search(title):
+                return button
+            try:
+                text = (button.inner_text() or "").strip()
+            except Exception:
+                text = ""
+            if text and pattern.search(text):
+                return button
+        return None
 
     def _wait_for_listing_ready(self, page, *, timeout_ms: int) -> bool:
         deadline = datetime.now().timestamp() + (timeout_ms / 1000)
@@ -177,13 +199,13 @@ class TenderArenaScraper:
                 page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
                 page.wait_for_timeout(300)
 
-                buyer_name = get_value_by_label(page, "Úřední název zadavatele")
-                buyer_ico = get_value_by_label(page, "IČO zadavatele")
-                title = get_value_by_label(page, "Název zakázky")
-                description = get_value_by_label(page, "Stručný popis (předmět zakázky)")
+                buyer_name = get_value_by_label(page, "uredni nazev zadavatele")
+                buyer_ico = get_value_by_label(page, "ico zadavatele")
+                title = get_value_by_label(page, "nazev zakazky")
+                description = get_value_by_label(page, "strucny popis")
 
-                deadline_raw = get_value_by_label(page, "Lhůta pro podání nabídek")
-                opening_raw = get_value_by_label(page, "Datum otevírání nabídek")
+                deadline_raw = get_value_by_label(page, "lhuta pro podani nabidek")
+                opening_raw = get_value_by_label(page, "datum otevirani nabidek")
 
                 submission_deadline_at = parse_cz_datetime(deadline_raw or "")
                 bids_opening_at = parse_cz_datetime(opening_raw or "")
@@ -215,11 +237,12 @@ class TenderArenaScraper:
             try:
                 sec = doc_sections.nth(i)
 
-                info_btn = sec.locator("button[title='Zobrazit detail']").first
-                if info_btn.count() == 0:
-                    info_btn = sec.locator("xpath=.//button[1]").first
-                if info_btn.count() == 0:
-                    continue
+                info_btn = self._button_by_name(sec, self._DETAIL_BUTTON_RE)
+                if info_btn is None:
+                    fallback = sec.locator("xpath=.//button[1]").first
+                    if fallback.count() == 0:
+                        continue
+                    info_btn = fallback
 
                 dismiss_common_overlays(page)
 
@@ -232,11 +255,11 @@ class TenderArenaScraper:
 
                 page.wait_for_selector(f"xpath={self.DOC_MODAL_XPATH}", timeout=timeout_ms)
 
-                display_name = get_value_by_label(page, "Název dokumentu")
-                category = get_value_by_label(page, "Kategorie dokumentu")
-                published_at = get_value_by_label(page, "Datum uveřejnění")
-                filename = get_value_by_label(page, "Název souboru")
-                size = get_value_by_label(page, "Velikost")
+                display_name = get_value_by_label(page, "nazev dokumentu")
+                category = get_value_by_label(page, "kategorie dokumentu")
+                published_at = get_value_by_label(page, "datum uverejneni")
+                filename = get_value_by_label(page, "nazev souboru")
+                size = get_value_by_label(page, "velikost")
 
                 out.append(
                     ScrapedDoc(
@@ -249,13 +272,9 @@ class TenderArenaScraper:
                 )
 
                 modal = page.locator(f"xpath={self.DOC_MODAL_XPATH}").first
-
-                close_btn = modal.get_by_role("button", name="Zavřít")
-                if close_btn.count() == 0:
-                    close_btn = modal.get_by_role("button", name="Close")
-
-                if close_btn.count() > 0:
-                    close_btn.first.click(timeout=2_000)
+                close_btn = self._button_by_name(modal, self._CLOSE_BUTTON_RE)
+                if close_btn is not None and close_btn.count() > 0:
+                    close_btn.click(timeout=2_000)
                 else:
                     page.keyboard.press("Escape")
 
