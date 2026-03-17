@@ -1,57 +1,23 @@
 from __future__ import annotations
 
+import logging
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from playwright.sync_api import Error as PWError
-from playwright.sync_api import sync_playwright
+import httpx
 
 from tenderscraper.config import settings
 from tenderscraper.repository import upsert_tender_meta
 from tenderscraper.scraping.files import guess_mime_type, sanitize_filename, sha256_file, unique_path
-from tenderscraper.scraping.label_value import get_value_by_label
-from tenderscraper.scraping.overlays import dismiss_common_overlays
 from tenderscraper.storage.object_store import persist_downloaded_file
 
-DOC_ROW_XPATH = "//*[@id='seznam-dokumentu']//app-dokument/section"
-DOC_MODAL_XPATH = "//*[@id='detail-dokumentu-modalni-panel']"
-DETAIL_BUTTON_RE = re.compile(r"zobrazit|detail", re.IGNORECASE)
-DOWNLOAD_BUTTON_RE = re.compile(r"stahnout|download", re.IGNORECASE)
-CLOSE_BUTTON_RE = re.compile(r"zavrit|close", re.IGNORECASE)
-
-
-def _button_by_name(scope, pattern: re.Pattern[str]):
-    buttons = scope.locator("button")
-    for i in range(buttons.count()):
-        button = buttons.nth(i)
-        try:
-            title = (button.get_attribute("title") or "").strip()
-        except Exception:
-            title = ""
-        if title and pattern.search(title):
-            return button
-        try:
-            text = (button.inner_text() or "").strip()
-        except Exception:
-            text = ""
-        if text and pattern.search(text):
-            return button
-    return None
-
-
-def _wait_clickable(locator, *, timeout_ms: int = 15_000) -> None:
-    locator.wait_for(state="visible", timeout=timeout_ms)
-    end = datetime.now(timezone.utc).timestamp() + (timeout_ms / 1000)
-    while datetime.now(timezone.utc).timestamp() < end:
-        try:
-            if locator.is_enabled():
-                return
-        except Exception:
-            pass
-        locator.page.wait_for_timeout(250)
+TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+FILENAME_RE = re.compile(r'filename="?([^";]+)"?')
+logger = logging.getLogger(__name__)
 
 
 def _scratch_dir(source: str, tender_id: str) -> Path:
@@ -64,159 +30,119 @@ def _safe_tmp_path(raw_dir: Path) -> Path:
     return raw_dir / f"__tmp__{uuid.uuid4().hex}"
 
 
-def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
-    notice_url = meta.get("notice_url")
-    if not notice_url:
-        return
+def _download_client() -> httpx.Client:
+    return httpx.Client(
+        timeout=60,
+        headers={
+            "accept": "application/octet-stream",
+            "accept-language": "en-US,en;q=0.9",
+            "origin": "https://tenderarena.cz",
+            "referer": "https://tenderarena.cz/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        },
+        follow_redirects=True,
+    )
 
+
+def _download_bytes(url: str, *, max_attempts: int = 4) -> tuple[bytes, httpx.Headers]:
+    delay_s = 1.0
+    last_error: Exception | None = None
+
+    with _download_client() as client:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = client.get(url)
+                if response.status_code in TRANSIENT_STATUS_CODES:
+                    raise httpx.HTTPStatusError(
+                        f"Transient response {response.status_code} for {url}",
+                        request=response.request,
+                        response=response,
+                    )
+                response.raise_for_status()
+                return response.content, response.headers
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_error = exc
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code not in TRANSIENT_STATUS_CODES:
+                    raise
+                retry_after = (exc.response.headers.get("retry-after") or "").strip()
+                if retry_after.isdigit():
+                    delay_s = max(delay_s, float(retry_after))
+
+            if attempt == max_attempts:
+                break
+
+            time.sleep(delay_s)
+            delay_s = min(delay_s * 2, 8.0)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to download TenderArena document from {url}")
+
+
+def _filename_from_headers(headers: httpx.Headers) -> str | None:
+    disposition = headers.get("content-disposition") or ""
+    match = FILENAME_RE.search(disposition)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
     source = str(meta.get("source") or "")
     tender_id = str(meta.get("source_tender_id") or "")
     raw_dir = _scratch_dir(source, tender_id)
 
     docs_meta: List[Dict[str, Any]] = meta.get("documents", [])
-    by_filename: Dict[str, Dict[str, Any]] = {}
-    for document in docs_meta:
-        filename = (document.get("filename") or "").strip()
-        if filename:
-            by_filename[filename] = document
-
-    if not by_filename:
+    if not docs_meta:
         return
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(accept_downloads=True)
+    for document in docs_meta:
+        if document.get("storage_key") and document.get("sha256"):
+            continue
+
+        download_url = (document.get("url") or "").strip()
+        filename = (document.get("filename") or "").strip()
+        if not download_url or not filename:
+            continue
 
         try:
-            page.goto(notice_url, wait_until="domcontentloaded", timeout=30_000)
-            page.wait_for_timeout(300)
-            dismiss_common_overlays(page)
+            payload, headers = _download_bytes(download_url)
+        except Exception as exc:
+            logger.warning("TenderArena document download failed for %s: %s", download_url, exc)
+            continue
 
-            doc_sections = page.locator(f"xpath={DOC_ROW_XPATH}")
-            if doc_sections.count() == 0:
-                return
+        header_filename = _filename_from_headers(headers)
+        safe_name = sanitize_filename(header_filename or filename)
+        target = unique_path(raw_dir / safe_name)
+        tmp = _safe_tmp_path(raw_dir)
+        tmp.write_bytes(payload)
 
-            for i in range(doc_sections.count()):
-                section = doc_sections.nth(i)
+        try:
+            tmp.replace(target)
+        except Exception:
+            data = tmp.read_bytes()
+            target.write_bytes(data)
+            tmp.unlink(missing_ok=True)
 
-                info_btn = _button_by_name(section, DETAIL_BUTTON_RE)
-                if info_btn is None or info_btn.count() == 0:
-                    continue
+        size_bytes = target.stat().st_size
+        sha = sha256_file(target)
+        mime = headers.get("content-type") or guess_mime_type(target.name)
+        stored = persist_downloaded_file(
+            file_path=target,
+            source=source,
+            tender_id=tender_id,
+        )
 
-                dismiss_common_overlays(page)
-                try:
-                    info_btn.click(timeout=5_000)
-                except Exception:
-                    dismiss_common_overlays(page)
-                    info_btn.click(timeout=5_000, force=True)
-
-                page.wait_for_selector(f"xpath={DOC_MODAL_XPATH}", timeout=30_000)
-                canonical = get_value_by_label(page, "nazev souboru")
-                canonical = canonical.strip() if canonical else None
-
-                modal = page.locator(f"xpath={DOC_MODAL_XPATH}").first
-                close_btn = _button_by_name(modal, CLOSE_BUTTON_RE)
-                if close_btn is not None and close_btn.count() > 0:
-                    close_btn.click(timeout=2_000)
-                else:
-                    page.keyboard.press("Escape")
-
-                page.wait_for_timeout(150)
-                dismiss_common_overlays(page)
-
-                if not canonical:
-                    continue
-
-                document = by_filename.get(canonical)
-                if not document:
-                    continue
-                if document.get("storage_key") and document.get("sha256"):
-                    continue
-
-                dl_btn = _button_by_name(section, DOWNLOAD_BUTTON_RE)
-                if dl_btn is None or dl_btn.count() == 0:
-                    continue
-
-                dismiss_common_overlays(page)
-                _wait_clickable(dl_btn, timeout_ms=15_000)
-
-                with page.expect_download(timeout=90_000) as download_info:
-                    try:
-                        dl_btn.click(timeout=10_000)
-                    except Exception:
-                        dismiss_common_overlays(page)
-                        dl_btn.click(timeout=10_000, force=True)
-
-                download = download_info.value
-
-                safe_name = sanitize_filename(canonical)
-                if Path(safe_name).suffix == "":
-                    suggested = download.suggested_filename or ""
-                    ext = Path(suggested).suffix
-                    if ext:
-                        safe_name = safe_name + ext
-
-                target = unique_path(raw_dir / safe_name)
-                tmp = _safe_tmp_path(raw_dir)
-
-                saved = False
-                for _attempt in range(1, 4):
-                    try:
-                        download.save_as(str(tmp))
-                        saved = True
-                        break
-                    except PWError as exc:
-                        if "canceled" not in str(exc).lower():
-                            raise
-                        try:
-                            if tmp.exists():
-                                tmp.unlink()
-                        except Exception:
-                            pass
-
-                        page.wait_for_timeout(700)
-                        dismiss_common_overlays(page)
-                        _wait_clickable(dl_btn, timeout_ms=15_000)
-
-                        with page.expect_download(timeout=90_000) as retry_info:
-                            try:
-                                dl_btn.click(timeout=10_000)
-                            except Exception:
-                                dismiss_common_overlays(page)
-                                dl_btn.click(timeout=10_000, force=True)
-
-                        download = retry_info.value
-                        tmp = _safe_tmp_path(raw_dir)
-
-                if not saved:
-                    continue
-
-                try:
-                    tmp.replace(target)
-                except Exception:
-                    data = tmp.read_bytes()
-                    target.write_bytes(data)
-                    tmp.unlink(missing_ok=True)
-
-                size_bytes = target.stat().st_size
-                sha = sha256_file(target)
-                mime = guess_mime_type(target.name)
-                stored = persist_downloaded_file(
-                    file_path=target,
-                    source=source,
-                    tender_id=tender_id,
-                )
-
-                document["storage_key"] = stored.storage_key
-                document["storage_url"] = stored.storage_url
-                document["size_bytes"] = int(size_bytes)
-                document["sha256"] = sha
-                document["mime_type"] = mime
-                document["downloaded_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-                page.wait_for_timeout(400)
-
-        finally:
-            browser.close()
+        document["filename"] = header_filename or filename
+        document["storage_key"] = stored.storage_key
+        document["storage_url"] = stored.storage_url
+        document["size_bytes"] = int(size_bytes)
+        document["sha256"] = sha
+        document["mime_type"] = mime
+        document["downloaded_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     upsert_tender_meta(meta)

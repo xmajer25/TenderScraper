@@ -1,25 +1,38 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timezone
+import json
+import random
+import time
+from typing import Any, Optional
+from urllib.parse import urljoin
 
-from playwright.sync_api import TimeoutError as PWTimeoutError
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Error as PWError, Page, Playwright, sync_playwright
 
-from tenderscraper.scraping.datetime_cz import parse_cz_datetime
-from tenderscraper.scraping.label_value import get_value_by_label
 from tenderscraper.scraping.overlays import dismiss_common_overlays
 
 
 @dataclass(frozen=True)
 class ScrapedDoc:
+    document_id: int | None
+    download_url: Optional[str]
     display_name: Optional[str]
     category: Optional[str]
     published_at: Optional[str]
     filename: Optional[str]
     size: Optional[str]
+
+
+@dataclass(frozen=True)
+class ScrapedTenderListingItem:
+    tender_id: int
+    source_tender_id: str
+    buyer_id: Optional[str]
+    buyer_name: Optional[str]
+    title: Optional[str]
+    submission_deadline_at: Optional[datetime]
+    notice_url: str
 
 
 @dataclass(frozen=True)
@@ -30,272 +43,444 @@ class ScrapedTenderDetail:
     description: Optional[str]
     submission_deadline_at: Optional[datetime]
     bids_opening_at: Optional[datetime]
-    docs: List[ScrapedDoc]
+    docs: list[ScrapedDoc]
 
 
 class TenderArenaScraper:
     BASE = "https://tenderarena.cz"
     START_URL = "https://tenderarena.cz/dodavatel"
+    API_BASE = "https://api.tenderarena.cz/ta/profil"
+    LIST_URL = f"{API_BASE}/seznam-zakazek/noveUverejneneZakazky"
+    DETAIL_URL = f"{API_BASE}/detail-zakazky"
+    PROFILE_URL = f"{API_BASE}/detail-profilu"
+    AI_SUMMARY_URL = f"{API_BASE}/ai/manazerske-shrnuti/nacist"
+    DOWNLOAD_URL = f"{API_BASE}/stahovani-dokumentu/dokument"
+    TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+    MAX_REQUESTS_PER_PAGE = 60
 
-    ROWS_XPATH = "//*[@id='zakazky']//app-seznam//section/a"
-    ROWS_XPATH_FALLBACK = "//*[@id='zakazky']//section//a[@href]"
-    NEXT_XPATH = "//*[@id='zakazky']//a[.//p[contains(normalize-space(), 'Dal')]]"
+    def __init__(
+        self,
+        *,
+        timeout_ms: int = 30_000,
+        request_pause_s: float = 0.6,
+        headless: bool = True,
+    ) -> None:
+        self.timeout_ms = timeout_ms
+        self.request_pause_s = request_pause_s
+        self.headless = headless
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self._page: Page | None = None
+        self._last_request_at = 0.0
+        self._request_count = 0
 
-    DOC_ROW_XPATH = "//*[@id='seznam-dokumentu']//app-dokument/section"
-    DOC_MODAL_XPATH = "//*[@id='detail-dokumentu-modalni-panel']"
+    def __enter__(self) -> "TenderArenaScraper":
+        self._ensure_page()
+        return self
 
-    _DETAIL_BUTTON_RE = re.compile(r"zobrazit|detail", re.IGNORECASE)
-    _CLOSE_BUTTON_RE = re.compile(r"zavrit|close", re.IGNORECASE)
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
-    def _listing_locator(self, page):
-        primary = page.locator(f"xpath={self.ROWS_XPATH}")
+    def close(self) -> None:
         try:
-            if primary.count() > 0:
-                return primary
+            if self._page is not None:
+                self._page.close()
+        finally:
+            self._page = None
+            try:
+                if self._context is not None:
+                    self._context.close()
+            finally:
+                self._context = None
+                try:
+                    if self._browser is not None:
+                        self._browser.close()
+                finally:
+                    self._browser = None
+                    if self._playwright is not None:
+                        self._playwright.stop()
+                        self._playwright = None
+
+    def _launch_browser(self) -> Browser:
+        if self._playwright is None:
+            raise RuntimeError("Playwright is not initialized")
+
+        base_launch_kwargs = {
+            "args": [
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        }
+        candidates = [
+            {"headless": True, **base_launch_kwargs},
+            {"channel": "msedge", "headless": True, **base_launch_kwargs},
+            {"headless": False, **base_launch_kwargs},
+            {"channel": "msedge", "headless": False, **base_launch_kwargs},
+        ]
+
+        last_error: Exception | None = None
+        for candidate in candidates:
+            try:
+                return self._playwright.chromium.launch(**candidate)
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to launch Playwright browser")
+
+    def _create_page(self) -> Page:
+        self._playwright = sync_playwright().start()
+        last_error: Exception | None = None
+
+        for _ in range(4):
+            try:
+                self._browser = self._launch_browser()
+                self._context = self._browser.new_context(ignore_https_errors=True)
+                self._page = self._context.new_page()
+                break
+            except PWError as exc:
+                last_error = exc
+                try:
+                    if self._page is not None:
+                        self._page.close()
+                except Exception:
+                    pass
+                self._page = None
+                try:
+                    if self._context is not None:
+                        self._context.close()
+                except Exception:
+                    pass
+                self._context = None
+                try:
+                    if self._browser is not None:
+                        self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+
+        if self._page is None:
+            self.close()
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Failed to create Playwright page for TenderArena")
+
+        self._page.goto(self.START_URL, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        self._page.wait_for_timeout(1_000)
+        dismiss_common_overlays(self._page)
+        self._request_count = 0
+        return self._page
+
+    def _ensure_page(self) -> Page:
+        if self._page is not None:
+            return self._page
+        return self._create_page()
+
+    def _recreate_page(self) -> Page:
+        try:
+            if self._page is not None:
+                self._page.close()
         except Exception:
             pass
-        return page.locator(f"xpath={self.ROWS_XPATH_FALLBACK}")
+        self._page = None
 
-    def _button_by_name(self, scope, pattern: re.Pattern[str]):
-        buttons = scope.locator("button")
-        for i in range(buttons.count()):
-            button = buttons.nth(i)
-            try:
-                title = (button.get_attribute("title") or "").strip()
-            except Exception:
-                title = ""
-            if title and pattern.search(title):
-                return button
-            try:
-                text = (button.inner_text() or "").strip()
-            except Exception:
-                text = ""
-            if text and pattern.search(text):
-                return button
-        return None
+        try:
+            if self._context is not None:
+                self._context.close()
+        except Exception:
+            pass
+        self._context = None
 
-    def _wait_for_listing_ready(self, page, *, timeout_ms: int) -> bool:
-        deadline = datetime.now().timestamp() + (timeout_ms / 1000)
-        while datetime.now().timestamp() < deadline:
-            dismiss_common_overlays(page)
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        except Exception:
+            pass
+        self._browser = None
+
+        if self._playwright is not None:
             try:
-                page.wait_for_load_state("networkidle", timeout=2_000)
+                self._playwright.stop()
             except Exception:
                 pass
+            self._playwright = None
 
-            anchors = self._listing_locator(page)
+        return self._create_page()
+
+    def _pace(self) -> None:
+        elapsed = time.monotonic() - self._last_request_at
+        sleep_s = self.request_pause_s - elapsed
+        if sleep_s > 0:
+            time.sleep(sleep_s + random.uniform(0.05, 0.25))
+
+    @staticmethod
+    def _retry_delay_for_status(status: int, headers: dict[str, str], current_delay_s: float) -> float:
+        retry_after = (headers.get("retry-after") or "").strip()
+        if retry_after.isdigit():
+            return max(float(retry_after), current_delay_s)
+        if status == 429:
+            return max(current_delay_s, 10.0)
+        if status in {500, 502, 503, 504}:
+            return max(current_delay_s, 3.0)
+        return current_delay_s
+
+    def _fetch_json_via_browser(
+        self,
+        url: str,
+        *,
+        max_attempts: int = 4,
+    ) -> dict[str, Any]:
+        page = self._ensure_page()
+        delay_s = 1.5
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
             try:
-                if anchors.count() > 0:
-                    return True
-            except Exception:
-                pass
+                if self._page is None or self._request_count >= self.MAX_REQUESTS_PER_PAGE:
+                    page = self._recreate_page() if self._page is not None else self._ensure_page()
+                self._pace()
+                dismiss_common_overlays(page)
+                if self._context is None:
+                    raise RuntimeError("TenderArena browser context is not available")
+                response = self._context.request.get(
+                    url,
+                    headers={
+                        "accept": "application/json",
+                        "accept-language": "en-US,en;q=0.9",
+                        "content-type": "application/json",
+                        "origin": self.BASE,
+                        "referer": f"{self.BASE}/",
+                    },
+                    fail_on_status_code=False,
+                    timeout=self.timeout_ms,
+                )
+                self._last_request_at = time.monotonic()
+                self._request_count += 1
 
-            page.wait_for_timeout(500)
-        return False
-
-    def fetch_tender_urls(self, *, limit: int, headless: bool, timeout_ms: int) -> List[str]:
-        urls: List[str] = []
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            page = browser.new_page()
-
-            try:
-                page.goto(self.START_URL, wait_until="domcontentloaded", timeout=timeout_ms)
-                page.wait_for_timeout(1_000)
-                if not self._wait_for_listing_ready(page, timeout_ms=timeout_ms):
-                    return []
-
-                while len(urls) < limit:
-                    anchors = self._listing_locator(page)
-
-                    for i in range(anchors.count()):
-                        if len(urls) >= limit:
-                            break
-                        anchor = anchors.nth(i)
-                        href = anchor.get_attribute("href") or ""
-                        full = href if href.startswith("http") else f"{self.BASE}{href}"
-                        if full and full not in urls:
-                            urls.append(full)
-
-                    if len(urls) >= limit:
-                        break
-
-                    next_btn = page.locator(f"xpath={self.NEXT_XPATH}").first
-                    if next_btn.count() == 0:
-                        break
-
-                    before_first = None
+                status = response.status
+                text = response.text()
+                if status in self.TRANSIENT_STATUS_CODES:
+                    delay_s = self._retry_delay_for_status(status, response.headers, delay_s)
+                    raise RuntimeError(f"Transient response {status} for {url}")
+                if status < 200 or status >= 300:
+                    raise RuntimeError(f"Unexpected response {status} for {url}")
+                return json.loads(text or "{}")
+            except Exception as exc:
+                last_error = exc
+                try:
+                    message = str(exc)
+                except Exception:
+                    message = ""
+                if (
+                    "Failed to fetch" in message
+                    or "Target page" in message
+                    or "Execution context was destroyed" in message
+                    or "Transient response 429" in message
+                ):
                     try:
-                        if anchors.count() > 0:
-                            before_first = anchors.nth(0).get_attribute("href")
-                    except Exception:
-                        before_first = None
-
-                    dismiss_common_overlays(page)
-                    try:
-                        next_btn.scroll_into_view_if_needed(timeout=2_000)
+                        page = self._recreate_page()
                     except Exception:
                         pass
 
-                    clicked = False
-                    try:
-                        next_btn.click(timeout=5_000)
-                        clicked = True
-                    except Exception:
-                        dismiss_common_overlays(page)
-                        try:
-                            next_btn.click(timeout=5_000, force=True)
-                            clicked = True
-                        except Exception:
-                            clicked = False
+            if attempt == max_attempts:
+                break
 
-                    if not clicked:
-                        break
+            time.sleep(delay_s + random.uniform(0.2, 0.6))
+            delay_s = min(delay_s * 2, 30.0)
 
-                    changed = False
-                    for _ in range(32):
-                        page.wait_for_timeout(250)
-                        try:
-                            now_anchors = self._listing_locator(page)
-                            if now_anchors.count() == 0:
-                                continue
-                            now_first = now_anchors.nth(0).get_attribute("href")
-                            if before_first is None:
-                                changed = True
-                                break
-                            if now_first and now_first != before_first:
-                                changed = True
-                                break
-                        except Exception:
-                            continue
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"Failed to fetch TenderArena payload from {url}")
 
-                    if not changed:
-                        break
+    @staticmethod
+    def _parse_epoch_ms(value: Any) -> Optional[datetime]:
+        if value in (None, ""):
+            return None
+        try:
+            return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            return None
 
-                    if not self._wait_for_listing_ready(page, timeout_ms=timeout_ms):
-                        break
+    @staticmethod
+    def _first_non_empty(payload: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = payload.get(key)
+            if value not in (None, "", [], {}):
+                return value
+        return None
 
-            except PWTimeoutError:
-                return []
-            finally:
-                browser.close()
+    @staticmethod
+    def _clean_text(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
-        return urls
+    @classmethod
+    def _notice_url(cls, tender_id: int) -> str:
+        return urljoin(cls.BASE, f"/dodavatel/zakazka/{tender_id}")
+
+    def fetch_listing(
+        self,
+        *,
+        limit: int,
+    ) -> list[ScrapedTenderListingItem]:
+        payload = self._fetch_json_via_browser(
+            f"{self.LIST_URL}?t={int(datetime.now(tz=timezone.utc).timestamp() * 1000)}"
+        )
+
+        items: list[ScrapedTenderListingItem] = []
+        for raw in (payload.get("polozky") or [])[:limit]:
+            tender_id = raw.get("id")
+            if tender_id is None:
+                continue
+            try:
+                tender_id_int = int(tender_id)
+            except (TypeError, ValueError):
+                continue
+
+            items.append(
+                ScrapedTenderListingItem(
+                    tender_id=tender_id_int,
+                    source_tender_id=str(tender_id_int),
+                    buyer_id=self._clean_text(raw.get("idZadavatele")),
+                    buyer_name=self._clean_text(raw.get("uredniNazevZadavatele")),
+                    title=self._clean_text(raw.get("nazev")),
+                    submission_deadline_at=self._parse_epoch_ms(raw.get("lhutaProPodaniNabidek")),
+                    notice_url=self._notice_url(tender_id_int),
+                )
+            )
+        return items
+
+    def fetch_profile(self, *, buyer_id: str, timeout_ms: int = 30_000) -> dict[str, Any]:
+        return self._fetch_json_via_browser(f"{self.PROFILE_URL}/{buyer_id}")
 
     def fetch_detail(
         self,
         *,
-        url: str,
-        headless: bool = True,
+        tender_id: int,
         timeout_ms: int = 30_000,
-        include_docs: bool = True,
+    ) -> dict[str, Any]:
+        return self._fetch_json_via_browser(f"{self.DETAIL_URL}/{tender_id}")
+
+    def fetch_ai_summary(
+        self,
+        *,
+        tender_id: int,
+        timeout_ms: int = 30_000,
+    ) -> dict[str, Any]:
+        return self._fetch_json_via_browser(f"{self.AI_SUMMARY_URL}/{tender_id}")
+
+    def detail_has_description(self, detail_payload: dict[str, Any]) -> bool:
+        return bool(
+            self._clean_text(
+                self._first_non_empty(
+                    detail_payload,
+                    "strucnyPopis",
+                    "popis",
+                    "predmetZakazky",
+                )
+            )
+        )
+
+    def detail_docs(self, detail_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        docs = self._first_non_empty(
+            detail_payload,
+            "dokumenty",
+            "seznamDokumentu",
+            "dokumentace",
+        )
+        return list(docs or [])
+
+    def detail_has_docs(self, detail_payload: dict[str, Any]) -> bool:
+        return bool(self.detail_docs(detail_payload))
+
+    def build_detail(
+        self,
+        *,
+        listing_item: ScrapedTenderListingItem,
+        detail_payload: dict[str, Any],
+        ai_payload: dict[str, Any] | None,
+        profile_payload: dict[str, Any] | None,
     ) -> ScrapedTenderDetail:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
-            page = browser.new_page()
+        ai_summary = (ai_payload or {}).get("manazerskeShrnutiZadavaciDokumentace") or {}
+        ai_docs = (ai_payload or {}).get("dokumenty") or []
+        detail_docs = self.detail_docs(detail_payload)
+        profile_ident = (profile_payload or {}).get("identifikacniUdaje") or {}
 
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                page.wait_for_timeout(300)
+        description = self._clean_text(
+            self._first_non_empty(
+                detail_payload,
+                "strucnyPopis",
+                "popis",
+                "predmetZakazky",
+            )
+        ) or self._clean_text(ai_summary.get("predmetZakazky"))
 
-                buyer_name = get_value_by_label(page, "uredni nazev zadavatele")
-                buyer_ico = get_value_by_label(page, "ico zadavatele")
-                title = get_value_by_label(page, "nazev zakazky")
-                description = get_value_by_label(page, "strucny popis")
-
-                deadline_raw = get_value_by_label(page, "lhuta pro podani nabidek")
-                opening_raw = get_value_by_label(page, "datum otevirani nabidek")
-
-                submission_deadline_at = parse_cz_datetime(deadline_raw or "")
-                bids_opening_at = parse_cz_datetime(opening_raw or "")
-
-                docs: List[ScrapedDoc] = []
-                if include_docs:
-                    docs = self._extract_docs(page, timeout_ms=timeout_ms)
-
-                return ScrapedTenderDetail(
-                    buyer_name=buyer_name,
-                    buyer_ico=buyer_ico,
-                    title=title,
-                    description=description,
-                    submission_deadline_at=submission_deadline_at,
-                    bids_opening_at=bids_opening_at,
-                    docs=docs,
+        docs_source = ai_docs or detail_docs
+        docs: list[ScrapedDoc] = []
+        for raw in docs_source:
+            docs.append(
+                ScrapedDoc(
+                    document_id=int(raw["id"]) if raw.get("id") is not None else None,
+                    download_url=(
+                        f"{self.DOWNLOAD_URL}/{int(raw['id'])}"
+                        if raw.get("id") is not None
+                        else None
+                    ),
+                    display_name=self._clean_text(
+                        self._first_non_empty(raw, "nazev", "displayName", "popis")
+                    ),
+                    category=self._clean_text(self._first_non_empty(raw, "typ", "kategorie")),
+                    published_at=self._clean_text(
+                        self._first_non_empty(raw, "datumUverejneni", "publishedAt")
+                    ),
+                    filename=self._clean_text(
+                        self._first_non_empty(raw, "nazev", "nazevSouboru", "fileName")
+                    ),
+                    size=self._clean_text(self._first_non_empty(raw, "velikost", "size")),
                 )
-            finally:
-                browser.close()
+            )
 
-    def _extract_docs(self, page, *, timeout_ms: int):
-        out: List[ScrapedDoc] = []
-        doc_sections = page.locator(f"xpath={self.DOC_ROW_XPATH}")
-
-        if doc_sections.count() == 0:
-            return out
-
-        for i in range(doc_sections.count()):
-            try:
-                sec = doc_sections.nth(i)
-
-                info_btn = self._button_by_name(sec, self._DETAIL_BUTTON_RE)
-                if info_btn is None:
-                    fallback = sec.locator("xpath=.//button[1]").first
-                    if fallback.count() == 0:
-                        continue
-                    info_btn = fallback
-
-                dismiss_common_overlays(page)
-
-                try:
-                    info_btn.click(trial=True, timeout=2_000)
-                    info_btn.click(timeout=5_000)
-                except Exception:
-                    dismiss_common_overlays(page)
-                    info_btn.click(timeout=5_000, force=True)
-
-                page.wait_for_selector(f"xpath={self.DOC_MODAL_XPATH}", timeout=timeout_ms)
-
-                display_name = get_value_by_label(page, "nazev dokumentu")
-                category = get_value_by_label(page, "kategorie dokumentu")
-                published_at = get_value_by_label(page, "datum uverejneni")
-                filename = get_value_by_label(page, "nazev souboru")
-                size = get_value_by_label(page, "velikost")
-
-                out.append(
-                    ScrapedDoc(
-                        display_name=display_name,
-                        category=category,
-                        published_at=published_at,
-                        filename=filename,
-                        size=size,
-                    )
+        return ScrapedTenderDetail(
+            buyer_name=self._clean_text(
+                self._first_non_empty(
+                    detail_payload,
+                    "uredniNazevZadavatele",
+                    "nazevZadavatele",
                 )
-
-                modal = page.locator(f"xpath={self.DOC_MODAL_XPATH}").first
-                close_btn = self._button_by_name(modal, self._CLOSE_BUTTON_RE)
-                if close_btn is not None and close_btn.count() > 0:
-                    close_btn.click(timeout=2_000)
-                else:
-                    page.keyboard.press("Escape")
-
-                page.wait_for_timeout(150)
-
-                overlay = page.locator(".modal-overlay").first
-                try:
-                    overlay.wait_for(state="hidden", timeout=3_000)
-                except Exception:
-                    try:
-                        overlay.click(force=True, timeout=1_000)
-                    except Exception:
-                        pass
-
-                try:
-                    modal.wait_for(state="hidden", timeout=3_000)
-                except Exception:
-                    pass
-
-            except Exception:
-                dismiss_common_overlays(page)
-                continue
-
-        return out
+            )
+            or listing_item.buyer_name
+            or self._clean_text((profile_payload or {}).get("uredniNazev")),
+            buyer_ico=self._clean_text(
+                self._first_non_empty(
+                    detail_payload,
+                    "icoZadavatele",
+                    "icZadavatele",
+                )
+            )
+            or self._clean_text(profile_ident.get("ic")),
+            title=self._clean_text(detail_payload.get("nazev")) or listing_item.title,
+            description=description,
+            submission_deadline_at=self._parse_epoch_ms(
+                self._first_non_empty(
+                    detail_payload,
+                    "lhutaProPodaniNabidek",
+                    "datumKonceLhuty",
+                )
+            )
+            or listing_item.submission_deadline_at,
+            bids_opening_at=self._parse_epoch_ms(
+                self._first_non_empty(
+                    detail_payload,
+                    "datumOteviraniNabidek",
+                    "datumOtevreniNabidek",
+                )
+            ),
+            docs=docs,
+        )

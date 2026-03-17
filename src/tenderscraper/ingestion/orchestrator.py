@@ -5,8 +5,6 @@ from typing import Iterable, List, Tuple
 
 from tenderscraper.connectors.base import TenderNotice
 from tenderscraper.db import create_db_and_tables
-from tenderscraper.downloader.poptavej import download_poptavej_docs
-from tenderscraper.downloader.tender_arena import download_tender_arena_docs
 from tenderscraper.repository import get_tender_meta, upsert_tender_meta
 
 TenderRef = Tuple[str, str]
@@ -34,6 +32,10 @@ def download_docs_for_ingested_tenders(tender_refs: List[TenderRef]) -> None:
             continue
 
         if source == "tender_arena":
+            from tenderscraper.downloader.tender_arena import download_tender_arena_docs
+
             download_tender_arena_docs(meta=meta)
         elif source == "poptavej":
+            from tenderscraper.downloader.poptavej import download_poptavej_docs
+
             download_poptavej_docs(meta=meta)

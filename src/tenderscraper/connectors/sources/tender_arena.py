@@ -10,52 +10,72 @@ logger = logging.getLogger(__name__)
 
 class TenderArenaConnector(BaseConnector):
     source = "tender_arena"
+    OVERFETCH_MULTIPLIER = 3
+    MAX_LISTING_SCAN = 120
 
     def fetch(self, *, query: str | None = None, limit: int = 10):
-        scraper = TenderArenaScraper()
-
-        try:
-            urls = scraper.fetch_tender_urls(limit=limit, headless=True, timeout_ms=30_000)
-        except Exception as exc:
-            logger.warning("TenderArena listing fetch failed: %s", exc)
-            return []
-
         tenders: list[TenderNotice] = []
+        listing_limit = min(max(limit * self.OVERFETCH_MULTIPLIER, limit), self.MAX_LISTING_SCAN)
 
-        for url in urls:
+        with TenderArenaScraper(timeout_ms=30_000, request_pause_s=0.6) as scraper:
             try:
-                detail = scraper.fetch_detail(url=url, headless=True, include_docs=True)
+                items = scraper.fetch_listing(limit=listing_limit)
             except Exception as exc:
-                logger.warning("TenderArena detail fetch failed for %s: %s", url, exc)
-                continue
+                logger.warning("TenderArena listing fetch failed: %s", exc)
+                return []
 
-            source_id = url.rstrip("/").split("/")[-1]
-            title = detail.title or "Unknown title"
+            for item in items:
+                if len(tenders) >= limit:
+                    break
 
-            docs: list[TenderDocument] = []
-            for d in detail.docs:
-                if d.filename:
-                    docs.append(
-                        TenderDocument(
-                            url=url,  # provenance; real download URL will come later
-                            filename=d.filename,
-                            mime_type=None,
+                detail_payload: dict = {}
+                try:
+                    ai_payload = scraper.fetch_ai_summary(tender_id=item.tender_id, timeout_ms=30_000)
+                except Exception as exc:
+                    try:
+                        detail_payload = scraper.fetch_detail(tender_id=item.tender_id, timeout_ms=30_000)
+                        ai_payload = None
+                    except Exception as fallback_exc:
+                        logger.warning(
+                            "TenderArena summary/detail fetch failed for %s: %s | fallback: %s",
+                            item.notice_url,
+                            exc,
+                            fallback_exc,
                         )
-                    )
+                        continue
 
-            t = TenderNotice(
-                source=self.source,
-                source_tender_id=source_id,
-                title=title,
-                buyer=detail.buyer_name,
-                buyer_ico=detail.buyer_ico,
-                description=detail.description,
-                submission_deadline_at=detail.submission_deadline_at,
-                bids_opening_at=detail.bids_opening_at,
-                notice_url=url,
-                documents=docs,
-            )
+                detail = scraper.build_detail(
+                    listing_item=item,
+                    detail_payload=detail_payload,
+                    ai_payload=ai_payload,
+                    profile_payload=None,
+                )
+                title = detail.title or "Unknown title"
 
-            tenders.append(t)
+                docs: list[TenderDocument] = []
+                for d in detail.docs:
+                    if d.filename:
+                        docs.append(
+                            TenderDocument(
+                                url=d.download_url or item.notice_url,
+                                filename=d.filename,
+                                mime_type=None,
+                            )
+                        )
+
+                t = TenderNotice(
+                    source=self.source,
+                    source_tender_id=item.source_tender_id,
+                    title=title,
+                    buyer=detail.buyer_name,
+                    buyer_ico=detail.buyer_ico,
+                    description=detail.description,
+                    submission_deadline_at=detail.submission_deadline_at,
+                    bids_opening_at=detail.bids_opening_at,
+                    notice_url=item.notice_url,
+                    documents=docs,
+                )
+
+                tenders.append(t)
 
         return tenders

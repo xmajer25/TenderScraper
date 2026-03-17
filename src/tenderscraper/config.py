@@ -13,7 +13,11 @@ class Settings(BaseSettings):
     poptavej_username: str | None = Field(default=None, validation_alias="POPTAVEJ_USERNAME")
     poptavej_password: str | None = Field(default=None, validation_alias="POPTAVEJ_PASSWORD")
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")
     scratch_dir: Path = Field(
