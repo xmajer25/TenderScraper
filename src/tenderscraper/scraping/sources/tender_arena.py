@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import random
 import time
+from json import JSONDecodeError
 from typing import Any, Optional
 from urllib.parse import urljoin
 
@@ -74,6 +75,7 @@ class TenderArenaScraper:
         self._page: Page | None = None
         self._last_request_at = 0.0
         self._request_count = 0
+        self._cooldown_until = 0.0
 
     def __enter__(self) -> "TenderArenaScraper":
         self._ensure_page()
@@ -213,10 +215,18 @@ class TenderArenaScraper:
         return self._create_page()
 
     def _pace(self) -> None:
-        elapsed = time.monotonic() - self._last_request_at
+        now = time.monotonic()
+        if now < self._cooldown_until:
+            time.sleep(self._cooldown_until - now)
+            now = time.monotonic()
+
+        elapsed = now - self._last_request_at
         sleep_s = self.request_pause_s - elapsed
         if sleep_s > 0:
             time.sleep(sleep_s + random.uniform(0.05, 0.25))
+
+    def _set_cooldown(self, delay_s: float) -> None:
+        self._cooldown_until = max(self._cooldown_until, time.monotonic() + delay_s)
 
     @staticmethod
     def _retry_delay_for_status(status: int, headers: dict[str, str], current_delay_s: float) -> float:
@@ -266,10 +276,17 @@ class TenderArenaScraper:
                 text = response.text()
                 if status in self.TRANSIENT_STATUS_CODES:
                     delay_s = self._retry_delay_for_status(status, response.headers, delay_s)
+                    self._set_cooldown(delay_s)
                     raise RuntimeError(f"Transient response {status} for {url}")
                 if status < 200 or status >= 300:
                     raise RuntimeError(f"Unexpected response {status} for {url}")
-                return json.loads(text or "{}")
+                text = (text or "").strip()
+                if not text:
+                    return {}
+                try:
+                    return json.loads(text)
+                except JSONDecodeError as exc:
+                    raise RuntimeError(f"Invalid JSON response for {url}: {exc}") from exc
             except Exception as exc:
                 last_error = exc
                 try:
@@ -281,6 +298,7 @@ class TenderArenaScraper:
                     or "Target page" in message
                     or "Execution context was destroyed" in message
                     or "Transient response 429" in message
+                    or "Invalid JSON response" in message
                 ):
                     try:
                         page = self._recreate_page()
@@ -328,14 +346,18 @@ class TenderArenaScraper:
     def fetch_listing(
         self,
         *,
-        limit: int,
+        limit: int | None,
     ) -> list[ScrapedTenderListingItem]:
         payload = self._fetch_json_via_browser(
             f"{self.LIST_URL}?t={int(datetime.now(tz=timezone.utc).timestamp() * 1000)}"
         )
 
         items: list[ScrapedTenderListingItem] = []
-        for raw in (payload.get("polozky") or [])[:limit]:
+        rows = payload.get("polozky") or []
+        if limit is not None:
+            rows = rows[:limit]
+
+        for raw in rows:
             tender_id = raw.get("id")
             if tender_id is None:
                 continue
@@ -365,16 +387,24 @@ class TenderArenaScraper:
         *,
         tender_id: int,
         timeout_ms: int = 30_000,
+        max_attempts: int = 4,
     ) -> dict[str, Any]:
-        return self._fetch_json_via_browser(f"{self.DETAIL_URL}/{tender_id}")
+        return self._fetch_json_via_browser(
+            f"{self.DETAIL_URL}/{tender_id}",
+            max_attempts=max_attempts,
+        )
 
     def fetch_ai_summary(
         self,
         *,
         tender_id: int,
         timeout_ms: int = 30_000,
+        max_attempts: int = 4,
     ) -> dict[str, Any]:
-        return self._fetch_json_via_browser(f"{self.AI_SUMMARY_URL}/{tender_id}")
+        return self._fetch_json_via_browser(
+            f"{self.AI_SUMMARY_URL}/{tender_id}",
+            max_attempts=max_attempts,
+        )
 
     def detail_has_description(self, detail_payload: dict[str, Any]) -> bool:
         return bool(

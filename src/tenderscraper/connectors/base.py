@@ -48,5 +48,5 @@ class BaseConnector(ABC):
     source: str
 
     @abstractmethod
-    def fetch(self, *, query: str | None = None, limit: int = 10) -> List[TenderNotice]:
+    def fetch(self, *, query: str | None = None, limit: int | None = 10) -> List[TenderNotice]:
         raise NotImplementedError

@@ -91,6 +91,20 @@ def _filename_from_headers(headers: httpx.Headers) -> str | None:
     return None
 
 
+def _normalize_document_urls(document: Dict[str, Any]) -> None:
+    source_url = (document.get("source_url") or document.get("url") or "").strip() or None
+    storage_key = (document.get("storage_key") or "").strip() or None
+    storage_url = (document.get("storage_url") or "").strip() or None
+    if not storage_url and storage_key:
+        storage_url = settings.public_object_url(storage_key)
+
+    if source_url:
+        document["source_url"] = source_url
+    if storage_url:
+        document["storage_url"] = storage_url
+        document["download_url"] = storage_url
+
+
 def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
     source = str(meta.get("source") or "")
     tender_id = str(meta.get("source_tender_id") or "")
@@ -101,6 +115,7 @@ def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
         return
 
     for document in docs_meta:
+        _normalize_document_urls(document)
         if document.get("storage_key") and document.get("sha256"):
             continue
 
@@ -137,9 +152,13 @@ def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
             tender_id=tender_id,
         )
 
+        document["source_url"] = document.get("source_url") or download_url
         document["filename"] = header_filename or filename
         document["storage_key"] = stored.storage_key
-        document["storage_url"] = stored.storage_url
+        document["storage_url"] = stored.storage_url or (
+            settings.public_object_url(stored.storage_key) if stored.storage_key else None
+        )
+        document["download_url"] = document.get("storage_url")
         document["size_bytes"] = int(size_bytes)
         document["sha256"] = sha
         document["mime_type"] = mime

@@ -41,6 +41,8 @@ Ad hoc example:
 docker compose --profile tools run --rm -e SCRAPER_SOURCES=ted -e SCRAPER_LIMIT=1 -e SCRAPER_DOWNLOAD_DOCS=false scraper
 ```
 
+Use `SCRAPER_LIMIT=0` for an unlimited run, meaning "fetch everything the connector can currently enumerate".
+
 ## Optional local cron container
 
 ```bash
@@ -133,6 +135,19 @@ From the app container:
 
 ```bash
 docker compose exec api tenderscraper db-stats
+```
+
+Reset app tables in the configured database:
+
+```bash
+tenderscraper db-reset --yes
+```
+
+Unlimited ingest examples:
+
+```bash
+tenderscraper ingest --source poptavej --limit 0 --download-docs
+tenderscraper ingest --source tender_arena --limit 0 --download-docs
 ```
 
 From Postgres directly:

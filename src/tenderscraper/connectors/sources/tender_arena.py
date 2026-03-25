@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from tenderscraper.connectors.base import BaseConnector, TenderDocument, TenderNotice
+from tenderscraper.scraping.files import guess_mime_type
 from tenderscraper.scraping.sources.tender_arena import TenderArenaScraper
 
 logger = logging.getLogger(__name__)
@@ -11,13 +12,16 @@ logger = logging.getLogger(__name__)
 class TenderArenaConnector(BaseConnector):
     source = "tender_arena"
     OVERFETCH_MULTIPLIER = 3
-    MAX_LISTING_SCAN = 120
 
-    def fetch(self, *, query: str | None = None, limit: int = 10):
+    def fetch(self, *, query: str | None = None, limit: int | None = 10):
         tenders: list[TenderNotice] = []
-        listing_limit = min(max(limit * self.OVERFETCH_MULTIPLIER, limit), self.MAX_LISTING_SCAN)
+        listing_limit = (
+            None
+            if limit is None
+            else max(limit * self.OVERFETCH_MULTIPLIER, limit)
+        )
 
-        with TenderArenaScraper(timeout_ms=30_000, request_pause_s=0.6) as scraper:
+        with TenderArenaScraper(timeout_ms=30_000, request_pause_s=1.0) as scraper:
             try:
                 items = scraper.fetch_listing(limit=listing_limit)
             except Exception as exc:
@@ -25,24 +29,35 @@ class TenderArenaConnector(BaseConnector):
                 return []
 
             for item in items:
-                if len(tenders) >= limit:
+                if limit is not None and len(tenders) >= limit:
                     break
 
                 detail_payload: dict = {}
+                ai_payload: dict | None = None
                 try:
-                    ai_payload = scraper.fetch_ai_summary(tender_id=item.tender_id, timeout_ms=30_000)
+                    detail_payload = scraper.fetch_detail(
+                        tender_id=item.tender_id,
+                        timeout_ms=30_000,
+                        max_attempts=2,
+                    )
                 except Exception as exc:
+                    message = str(exc)
+                    if "429" not in message:
+                        logger.warning("TenderArena detail fetch failed for %s: %s", item.notice_url, exc)
+                    tenders.append(self._build_listing_only_notice(item))
+                    continue
+
+                if not scraper.detail_has_description(detail_payload) or not scraper.detail_has_docs(
+                    detail_payload
+                ):
                     try:
-                        detail_payload = scraper.fetch_detail(tender_id=item.tender_id, timeout_ms=30_000)
-                        ai_payload = None
-                    except Exception as fallback_exc:
-                        logger.warning(
-                            "TenderArena summary/detail fetch failed for %s: %s | fallback: %s",
-                            item.notice_url,
-                            exc,
-                            fallback_exc,
+                        ai_payload = scraper.fetch_ai_summary(
+                            tender_id=item.tender_id,
+                            timeout_ms=30_000,
+                            max_attempts=1,
                         )
-                        continue
+                    except Exception:
+                        ai_payload = None
 
                 detail = scraper.build_detail(
                     listing_item=item,
@@ -59,7 +74,7 @@ class TenderArenaConnector(BaseConnector):
                             TenderDocument(
                                 url=d.download_url or item.notice_url,
                                 filename=d.filename,
-                                mime_type=None,
+                                mime_type=guess_mime_type(d.filename),
                             )
                         )
 
@@ -79,3 +94,17 @@ class TenderArenaConnector(BaseConnector):
                 tenders.append(t)
 
         return tenders
+
+    def _build_listing_only_notice(self, item) -> TenderNotice:
+        return TenderNotice(
+            source=self.source,
+            source_tender_id=item.source_tender_id,
+            title=item.title or "Unknown title",
+            buyer=item.buyer_name,
+            buyer_ico=None,
+            description=None,
+            submission_deadline_at=item.submission_deadline_at,
+            bids_opening_at=None,
+            notice_url=item.notice_url,
+            documents=[],
+        )

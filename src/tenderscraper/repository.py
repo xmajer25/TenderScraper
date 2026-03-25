@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, or_
 from sqlmodel import Session, select
@@ -77,6 +77,17 @@ def list_sources() -> List[str]:
     with session_scope() as db:
         rows = db.exec(select(TenderRecord.source).distinct()).all()
         return sorted(str(row) for row in rows)
+
+
+def list_tender_refs(*, source: str | None = None, limit: int | None = None) -> List[Tuple[str, str]]:
+    with session_scope() as db:
+        statement = select(TenderRecord.source, TenderRecord.source_tender_id).order_by(TenderRecord.ingested_at.desc())
+        if source:
+            statement = statement.where(TenderRecord.source == source)
+        if limit is not None:
+            statement = statement.limit(limit)
+        rows = db.exec(statement).all()
+        return [(str(row[0]), str(row[1])) for row in rows]
 
 
 def list_tenders(

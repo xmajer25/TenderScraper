@@ -86,6 +86,20 @@ def _parse_placeholder_index(filename: str) -> Optional[int]:
         return None
 
 
+def _normalize_document_urls(document: Dict[str, Any]) -> None:
+    source_url = (document.get("source_url") or document.get("url") or "").strip() or None
+    storage_key = (document.get("storage_key") or "").strip() or None
+    storage_url = (document.get("storage_url") or "").strip() or None
+    if not storage_url and storage_key:
+        storage_url = settings.public_object_url(storage_key)
+
+    if source_url:
+        document["source_url"] = source_url
+    if storage_url:
+        document["storage_url"] = storage_url
+        document["download_url"] = storage_url
+
+
 def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) -> None:
     notice_url = meta.get("notice_url")
     if not notice_url:
@@ -149,6 +163,7 @@ def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) ->
                 return None
 
             for i, document in enumerate(docs_meta):
+                _normalize_document_urls(document)
                 if document.get("storage_key") and document.get("sha256"):
                     continue
 
@@ -190,10 +205,14 @@ def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) ->
                     tender_id=tender_id,
                 )
 
+                document["source_url"] = attachment.url
                 document["url"] = attachment.url
                 document["filename"] = attachment.filename
                 document["storage_key"] = stored.storage_key
-                document["storage_url"] = stored.storage_url
+                document["storage_url"] = stored.storage_url or (
+                    settings.public_object_url(stored.storage_key) if stored.storage_key else None
+                )
+                document["download_url"] = document.get("storage_url")
                 document["size_bytes"] = int(size_bytes)
                 document["sha256"] = sha
                 document["mime_type"] = mime

@@ -30,10 +30,44 @@ def _summary(meta: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _doc_download_endpoint(source: str, tender_id: str, doc_index: int) -> str:
+    return f"/tenders/{source}/{tender_id}/documents/{doc_index}"
+
+
+def _doc_public_payload(
+    document: Dict[str, Any],
+    *,
+    source: str,
+    tender_id: str,
+    doc_index: int,
+) -> Dict[str, Any]:
+    download_url = _doc_download_endpoint(source, tender_id, doc_index)
+    source_url = document.get("url")
+    return {
+        **document,
+        "source_url": source_url,
+        "url": download_url,
+        "download_url": download_url,
+        "has_storage_object": bool(document.get("storage_key") or document.get("storage_url")),
+    }
+
+
+def _public_meta(meta: Dict[str, Any], source: str, tender_id: str) -> Dict[str, Any]:
+    out = dict(meta)
+    docs = meta.get("documents") or []
+    out["documents"] = [
+        _doc_public_payload(document=dict(document), source=source, tender_id=tender_id, doc_index=i)
+        for i, document in enumerate(docs)
+    ]
+    out["documents_api"] = f"/tenders/{source}/{tender_id}/documents"
+    return out
+
+
 def _doc_listing(meta: Dict[str, Any], source: str, tender_id: str) -> List[Dict[str, Any]]:
     docs = meta.get("documents") or []
     out: List[Dict[str, Any]] = []
     for i, d in enumerate(docs):
+        download_url = _doc_download_endpoint(source, tender_id, i)
         out.append(
             {
                 "index": i,
@@ -42,11 +76,13 @@ def _doc_listing(meta: Dict[str, Any], source: str, tender_id: str) -> List[Dict
                 "size_bytes": d.get("size_bytes"),
                 "sha256": d.get("sha256"),
                 "downloaded_at": d.get("downloaded_at"),
-                "url": d.get("url"),
+                "url": download_url,
+                "source_url": d.get("url"),
                 "storage_key": d.get("storage_key"),
                 "storage_url": d.get("storage_url"),
                 "has_storage_object": bool(d.get("storage_key") or d.get("storage_url")),
-                "download_endpoint": f"/tenders/{source}/{tender_id}/documents/{i}",
+                "download_endpoint": download_url,
+                "download_url": download_url,
             }
         )
     return out
@@ -124,14 +160,22 @@ def list_tenders_by_source(
     total, items = repo_list_tenders(source=source, offset=offset, limit=limit)
     if total == 0:
         raise HTTPException(status_code=404, detail=f"Unknown source '{source}'")
-    return {"source": source, "total": total, "limit": limit, "offset": offset, "items": items}
+    return {
+        "source": source,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            _public_meta(meta, source=source, tender_id=str(meta.get("source_tender_id") or ""))
+            for meta in items
+        ],
+    }
 
 
 @app.get("/tenders/{source}/{tender_id}")
 def get_tender(source: str, tender_id: str) -> Dict[str, Any]:
     meta = _get_meta_or_404(source, tender_id)
-    meta["documents_api"] = f"/tenders/{source}/{tender_id}/documents"
-    return meta
+    return _public_meta(meta, source=source, tender_id=tender_id)
 
 
 @app.get("/tenders/{source}/{tender_id}/documents")
