@@ -45,22 +45,31 @@ def _download_client() -> httpx.Client:
     )
 
 
-def _download_bytes(url: str, *, max_attempts: int = 4) -> tuple[bytes, httpx.Headers]:
+def _stream_download_to_file(
+    url: str,
+    *,
+    target_path: Path,
+    max_attempts: int = 4,
+) -> httpx.Headers:
     delay_s = 1.0
     last_error: Exception | None = None
 
     with _download_client() as client:
         for attempt in range(1, max_attempts + 1):
             try:
-                response = client.get(url)
-                if response.status_code in TRANSIENT_STATUS_CODES:
-                    raise httpx.HTTPStatusError(
-                        f"Transient response {response.status_code} for {url}",
-                        request=response.request,
-                        response=response,
-                    )
-                response.raise_for_status()
-                return response.content, response.headers
+                with client.stream("GET", url) as response:
+                    if response.status_code in TRANSIENT_STATUS_CODES:
+                        raise httpx.HTTPStatusError(
+                            f"Transient response {response.status_code} for {url}",
+                            request=response.request,
+                            response=response,
+                        )
+                    response.raise_for_status()
+                    with target_path.open("wb") as fh:
+                        for chunk in response.iter_bytes():
+                            if chunk:
+                                fh.write(chunk)
+                    return response.headers
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
             except httpx.HTTPStatusError as exc:
@@ -124,23 +133,27 @@ def download_tender_arena_docs(*, meta: Dict[str, Any]) -> None:
         if not download_url or not filename:
             continue
 
+        tmp = _safe_tmp_path(raw_dir)
         try:
-            payload, headers = _download_bytes(download_url)
+            headers = _stream_download_to_file(download_url, target_path=tmp)
         except Exception as exc:
             logger.warning("TenderArena document download failed for %s: %s", download_url, exc)
+            tmp.unlink(missing_ok=True)
             continue
 
         header_filename = _filename_from_headers(headers)
         safe_name = sanitize_filename(header_filename or filename)
         target = unique_path(raw_dir / safe_name)
-        tmp = _safe_tmp_path(raw_dir)
-        tmp.write_bytes(payload)
 
         try:
             tmp.replace(target)
         except Exception:
-            data = tmp.read_bytes()
-            target.write_bytes(data)
+            with tmp.open("rb") as src, target.open("wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
             tmp.unlink(missing_ok=True)
 
         size_bytes = target.stat().st_size

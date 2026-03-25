@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import gc
+
 import typer
 from tenderscraper.config import settings
 from tenderscraper.connectors.registry import get_connector
@@ -34,6 +36,9 @@ def ingest(
     if download_docs:
         from tenderscraper.ingestion.orchestrator import download_docs_for_ingested_tenders
 
+        # Release the in-memory tender payloads before document downloading starts.
+        del tenders
+        gc.collect()
         download_docs_for_ingested_tenders(tender_refs)
         typer.echo("Downloaded documents and updated database metadata")
 

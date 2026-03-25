@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+import httpx
 from playwright.sync_api import Page, sync_playwright
 
 from tenderscraper.config import settings
@@ -100,6 +102,55 @@ def _normalize_document_urls(document: Dict[str, Any]) -> None:
         document["download_url"] = storage_url
 
 
+def _download_client_from_storage_state(
+    storage_state_path: Path | str,
+    *,
+    referer: str,
+    timeout_ms: int,
+) -> httpx.Client:
+    payload = json.loads(Path(storage_state_path).read_text(encoding="utf-8"))
+    cookies = httpx.Cookies()
+
+    for cookie in payload.get("cookies") or []:
+        name = (cookie.get("name") or "").strip()
+        if not name:
+            continue
+        kwargs = {"path": (cookie.get("path") or "/")}
+        domain = (cookie.get("domain") or "").lstrip(".")
+        if domain:
+            kwargs["domain"] = domain
+        cookies.set(name, cookie.get("value") or "", **kwargs)
+
+    return httpx.Client(
+        timeout=max(timeout_ms / 1000, 1),
+        follow_redirects=True,
+        cookies=cookies,
+        headers={
+            "accept": "*/*",
+            "referer": referer,
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+            ),
+        },
+    )
+
+
+def _stream_download_to_file(
+    client: httpx.Client,
+    *,
+    url: str,
+    target_path: Path,
+) -> httpx.Headers:
+    with client.stream("GET", url) as response:
+        response.raise_for_status()
+        with target_path.open("wb") as fh:
+            for chunk in response.iter_bytes():
+                if chunk:
+                    fh.write(chunk)
+        return response.headers
+
+
 def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) -> None:
     notice_url = meta.get("notice_url")
     if not notice_url:
@@ -114,7 +165,11 @@ def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) ->
 
     storage_state = ensure_storage_state(headless=True, timeout_ms=30_000, force_relogin=False)
 
-    with sync_playwright() as p:
+    with _download_client_from_storage_state(
+        storage_state,
+        referer=str(notice_url),
+        timeout_ms=timeout_ms,
+    ) as download_client, sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(storage_state=str(storage_state))
         page = context.new_page()
@@ -181,24 +236,31 @@ def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) ->
                 target = unique_path(raw_dir / server_name)
                 tmp = _safe_tmp_path(raw_dir)
 
-                response = context.request.get(attachment.url, timeout=timeout_ms)
-                if not response.ok:
+                try:
+                    headers = _stream_download_to_file(
+                        download_client,
+                        url=attachment.url,
+                        target_path=tmp,
+                    )
+                except Exception:
                     document["url"] = attachment.url
+                    tmp.unlink(missing_ok=True)
                     continue
-
-                body = response.body()
-                tmp.write_bytes(body)
 
                 try:
                     tmp.replace(target)
                 except Exception:
-                    data = tmp.read_bytes()
-                    target.write_bytes(data)
+                    with tmp.open("rb") as src, target.open("wb") as dst:
+                        while True:
+                            chunk = src.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
                     tmp.unlink(missing_ok=True)
 
                 size_bytes = target.stat().st_size
                 sha = sha256_file(target)
-                mime = guess_mime_type(target.name)
+                mime = headers.get("content-type") or guess_mime_type(target.name)
                 stored = persist_downloaded_file(
                     file_path=target,
                     source=source,

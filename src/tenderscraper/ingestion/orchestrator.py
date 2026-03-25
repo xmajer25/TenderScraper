@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from datetime import datetime, timezone
 from typing import Iterable, List, Tuple
 
@@ -26,7 +27,7 @@ def ingest_all(*, tenders: Iterable[TenderNotice]) -> List[TenderRef]:
 
 
 def download_docs_for_ingested_tenders(tender_refs: List[TenderRef]) -> None:
-    for source, tender_id in tender_refs:
+    for idx, (source, tender_id) in enumerate(tender_refs, start=1):
         meta = get_tender_meta(source, tender_id)
         if not meta:
             continue
@@ -39,3 +40,7 @@ def download_docs_for_ingested_tenders(tender_refs: List[TenderRef]) -> None:
             from tenderscraper.downloader.poptavej import download_poptavej_docs
 
             download_poptavej_docs(meta=meta)
+
+        del meta
+        if idx % 5 == 0:
+            gc.collect()
