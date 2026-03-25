@@ -49,7 +49,7 @@ services:
       - key: SCRATCH_DIR
         value: /tmp/tenderscraper
       - key: SCRAPER_SOURCES
-        value: tender_arena,poptavej
+        value: poptavej
       - key: SCRAPER_LIMIT
         value: 100
       - key: SCRAPER_DOWNLOAD_DOCS

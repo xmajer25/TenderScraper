@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-SOURCES="${SCRAPER_SOURCES:-tender_arena,poptavej}"
+SOURCES="${SCRAPER_SOURCES:-poptavej}"
 LIMIT="${SCRAPER_LIMIT:-100}"
 DOWNLOAD_DOCS="${SCRAPER_DOWNLOAD_DOCS:-true}"
 FAIL_FAST="${SCRAPER_FAIL_FAST:-false}"
