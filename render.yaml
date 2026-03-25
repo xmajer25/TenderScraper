@@ -51,7 +51,7 @@ services:
       - key: SCRAPER_SOURCES
         value: tender_arena,poptavej
       - key: SCRAPER_LIMIT
-        value: 200
+        value: 100
       - key: SCRAPER_DOWNLOAD_DOCS
         value: true
       - key: S3_BUCKET
