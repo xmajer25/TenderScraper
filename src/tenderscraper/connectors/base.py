@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import date as dt_date, datetime
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
@@ -27,6 +27,9 @@ class TenderNotice(BaseModel):
     source: str
     source_tender_id: str
     title: str
+
+    date: Optional[dt_date] = None
+    price: Optional[str] = None
 
     buyer: Optional[str] = None
     buyer_ico: Optional[str] = None

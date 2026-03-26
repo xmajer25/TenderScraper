@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date as dt_date, datetime
 from typing import Any, Dict, Optional
 
 from sqlalchemy import Column, UniqueConstraint
@@ -15,6 +15,8 @@ class TenderRecord(SQLModel, table=True):
     source: str = Field(index=True)
     source_tender_id: str = Field(index=True)
     title: str = Field(index=True)
+    date: Optional[dt_date] = None
+    price: Optional[str] = None
     buyer: Optional[str] = None
     buyer_ico: Optional[str] = None
     description: Optional[str] = None

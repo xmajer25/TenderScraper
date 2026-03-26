@@ -166,6 +166,44 @@ def backfill_poptavej_deadlines(
     typer.echo(f"missing_deadline_in_listing: {missing}")
 
 
+@app.command("backfill-poptavej-date-price")
+def backfill_poptavej_date_price(
+    limit: int = typer.Option(
+        0,
+        min=0,
+        help="How many listing items to scan. Use 0 for all currently available listing pages.",
+    ),
+) -> None:
+    """Refresh date/price for existing poptavej tenders from listing pages."""
+    from tenderscraper.scraping.sources.poptavej import PoptavejScraper
+
+    settings.ensure_dirs()
+    create_db_and_tables()
+
+    scraper = PoptavejScraper()
+    items = scraper.fetch_listing(limit=None if limit == 0 else limit, headless=True, timeout_ms=30_000)
+
+    scanned = 0
+    updated = 0
+    missing_in_db = 0
+
+    for item in items:
+        scanned += 1
+        meta = get_tender_meta("poptavej", item.source_tender_id)
+        if not meta:
+            missing_in_db += 1
+            continue
+
+        meta["date"] = item.posted_at.date().isoformat() if item.posted_at else None
+        meta["price"] = (item.value_text or "").strip() or None
+        upsert_tender_meta(meta)
+        updated += 1
+
+    typer.echo(f"scanned: {scanned}")
+    typer.echo(f"updated: {updated}")
+    typer.echo(f"missing_in_db: {missing_in_db}")
+
+
 @app.command("backfill-document-storage")
 def backfill_document_storage(
     source: str = typer.Option(..., help="Connector source key, e.g. tender_arena or poptavej"),

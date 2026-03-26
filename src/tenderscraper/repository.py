@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date as dt_date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, or_
@@ -22,10 +22,31 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
     return None
 
 
+def _parse_date(value: Any) -> Optional[dt_date]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, dt_date):
+        return value
+    if isinstance(value, str) and value:
+        normalized = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized).date()
+        except ValueError:
+            try:
+                return dt_date.fromisoformat(value)
+            except ValueError:
+                return None
+    return None
+
+
 def _record_from_meta(record: TenderRecord, meta: Dict[str, Any]) -> TenderRecord:
     record.source = str(meta.get("source") or "")
     record.source_tender_id = str(meta.get("source_tender_id") or "")
     record.title = str(meta.get("title") or "Unknown title")
+    record.date = _parse_date(meta.get("date"))
+    record.price = meta.get("price")
     record.buyer = meta.get("buyer")
     record.buyer_ico = meta.get("buyer_ico")
     record.description = meta.get("description")

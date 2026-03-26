@@ -46,6 +46,8 @@ class PoptavejConnector(BaseConnector):
                     source=self.source,
                     source_tender_id=item.source_tender_id,
                     title=detail.title or item.title or "Unknown title",
+                    date=item.posted_at.date() if item.posted_at else None,
+                    price=(item.value_text or "").strip() or None,
                     buyer=detail.buyer_name,
                     buyer_ico=detail.buyer_ico,
                     description=detail.description_text or None,
