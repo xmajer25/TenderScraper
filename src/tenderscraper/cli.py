@@ -204,6 +204,51 @@ def backfill_poptavej_date_price(
     typer.echo(f"missing_in_db: {missing_in_db}")
 
 
+@app.command("backfill-poptavej-zip-docs")
+def backfill_poptavej_zip_docs(
+    limit: int = typer.Option(
+        0,
+        min=0,
+        help="How many existing poptavej tenders to process. Use 0 for all stored poptavej tenders.",
+    ),
+) -> None:
+    """Replace stored Poptavej ZIP documents with their extracted files and update metadata."""
+    from tenderscraper.downloader.poptavej import backfill_poptavej_zip_documents
+
+    settings.ensure_dirs()
+    create_db_and_tables()
+
+    if not settings.uses_s3_storage:
+        raise typer.BadParameter("backfill-poptavej-zip-docs currently requires STORAGE_BACKEND=s3.")
+
+    tender_refs = list_tender_refs(source="poptavej", limit=None if limit == 0 else limit)
+    if not tender_refs:
+        typer.echo("No matching poptavej tenders found.")
+        raise typer.Exit(code=0)
+
+    processed_tenders = 0
+    updated_tenders = 0
+    archives_expanded = 0
+    documents_uploaded = 0
+
+    for source, tender_id in tender_refs:
+        meta = get_tender_meta(source, tender_id)
+        if not meta:
+            continue
+
+        processed_tenders += 1
+        stats = backfill_poptavej_zip_documents(meta=meta)
+        if stats["archives_expanded"] > 0:
+            updated_tenders += 1
+            archives_expanded += stats["archives_expanded"]
+            documents_uploaded += stats["documents_uploaded"]
+
+    typer.echo(f"processed_tenders: {processed_tenders}")
+    typer.echo(f"updated_tenders: {updated_tenders}")
+    typer.echo(f"archives_expanded: {archives_expanded}")
+    typer.echo(f"documents_uploaded: {documents_uploaded}")
+
+
 @app.command("backfill-document-storage")
 def backfill_document_storage(
     source: str = typer.Option(..., help="Connector source key, e.g. tender_arena or poptavej"),

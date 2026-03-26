@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -14,14 +15,15 @@ from playwright.sync_api import Page, sync_playwright
 
 from tenderscraper.config import settings
 from tenderscraper.repository import upsert_tender_meta
+from tenderscraper.scraping.archives import extract_zip_archive, is_zip_file
 from tenderscraper.scraping.auth.poptavej_auth import ensure_storage_state
 from tenderscraper.scraping.files import guess_mime_type, sanitize_filename, sha256_file, unique_path
 from tenderscraper.scraping.overlays import dismiss_common_overlays
-from tenderscraper.storage.object_store import persist_downloaded_file
+from tenderscraper.storage.object_store import delete_stored_file, download_stored_file, persist_downloaded_file
 
 ATTACH_LINKS_SEL = "div.main-text h4:has-text('Přílohy') ~ a[target='_blank'][href]"
 _FILENAME_FROM_URL_RE = re.compile(r"/data/procurement/file/\d{4}/\d{2}/\d{2}/([^/?#]+)$", re.IGNORECASE)
-_PLACEHOLDER_RE = re.compile(r"^Příloha\s+č\.\s*(\d+)\b", re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -76,16 +78,6 @@ def _is_logged_in(page: Page) -> bool:
     except Exception:
         pass
     return False
-
-
-def _parse_placeholder_index(filename: str) -> Optional[int]:
-    match = _PLACEHOLDER_RE.match((filename or "").strip())
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
 
 
 def _normalize_document_urls(document: Dict[str, Any]) -> None:
@@ -151,6 +143,199 @@ def _stream_download_to_file(
         return response.headers
 
 
+def _document_has_stored_payload(document: Dict[str, Any]) -> bool:
+    return bool(document.get("storage_key") and document.get("sha256"))
+
+
+def _build_document_record(
+    *,
+    file_path: Path,
+    source: str,
+    tender_id: str,
+    source_url: str,
+    filename: str,
+    mime_type: str | None = None,
+) -> Dict[str, Any]:
+    size_bytes = file_path.stat().st_size
+    sha = sha256_file(file_path)
+    resolved_mime = mime_type or guess_mime_type(file_path.name)
+    stored = persist_downloaded_file(
+        file_path=file_path,
+        source=source,
+        tender_id=tender_id,
+    )
+    storage_url = stored.storage_url or (
+        settings.public_object_url(stored.storage_key) if stored.storage_key else None
+    )
+    return {
+        "source_url": source_url,
+        "url": source_url,
+        "filename": filename,
+        "mime_type": resolved_mime,
+        "storage_key": stored.storage_key,
+        "storage_url": storage_url,
+        "download_url": storage_url,
+        "size_bytes": int(size_bytes),
+        "sha256": sha,
+        "downloaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _extract_zip_documents(
+    *,
+    archive_path: Path,
+    raw_dir: Path,
+    source: str,
+    tender_id: str,
+    source_url: str,
+) -> List[Dict[str, Any]]:
+    extracted_dir = raw_dir / f"unzipped__{uuid.uuid4().hex}"
+    extracted_paths = extract_zip_archive(archive_path=archive_path, output_dir=extracted_dir)
+    documents: List[Dict[str, Any]] = []
+
+    for extracted_path in extracted_paths:
+        documents.append(
+            _build_document_record(
+                file_path=extracted_path,
+                source=source,
+                tender_id=tender_id,
+                source_url=source_url,
+                filename=extracted_path.name,
+            )
+        )
+
+    return documents
+
+
+def _persist_downloaded_attachment(
+    *,
+    file_path: Path,
+    raw_dir: Path,
+    source: str,
+    tender_id: str,
+    source_url: str,
+    filename: str,
+    mime_type: str | None = None,
+) -> List[Dict[str, Any]]:
+    if is_zip_file(file_path):
+        try:
+            extracted_docs = _extract_zip_documents(
+                archive_path=file_path,
+                raw_dir=raw_dir,
+                source=source,
+                tender_id=tender_id,
+                source_url=source_url,
+            )
+            if extracted_docs:
+                file_path.unlink(missing_ok=True)
+                return extracted_docs
+        except Exception as exc:
+            logger.warning("Poptavej ZIP extraction failed for %s: %s", file_path.name, exc)
+
+    return [
+        _build_document_record(
+            file_path=file_path,
+            source=source,
+            tender_id=tender_id,
+            source_url=source_url,
+            filename=filename,
+            mime_type=mime_type,
+        )
+    ]
+
+
+def _document_is_zip(document: Dict[str, Any]) -> bool:
+    filename = (document.get("filename") or "").strip().lower()
+    mime_type = (document.get("mime_type") or "").strip().lower()
+    storage_key = (document.get("storage_key") or "").strip().lower()
+    source_url = (document.get("source_url") or document.get("url") or "").strip().lower()
+    return (
+        filename.endswith(".zip")
+        or storage_key.endswith(".zip")
+        or source_url.endswith(".zip")
+        or "zip" in mime_type
+    )
+
+
+def backfill_poptavej_zip_documents(*, meta: Dict[str, Any]) -> Dict[str, int]:
+    source = str(meta.get("source") or "")
+    tender_id = str(meta.get("source_tender_id") or "")
+    raw_dir = _scratch_dir(source, tender_id)
+
+    docs_meta: List[Dict[str, Any]] = meta.get("documents", []) or []
+    if not docs_meta:
+        return {"archives_expanded": 0, "documents_uploaded": 0}
+
+    archives_expanded = 0
+    documents_uploaded = 0
+    changed = False
+    storage_keys_to_delete: List[str] = []
+    updated_documents: List[Dict[str, Any]] = []
+
+    for document in docs_meta:
+        _normalize_document_urls(document)
+        if not _document_is_zip(document):
+            updated_documents.append(document)
+            continue
+
+        storage_key = (document.get("storage_key") or "").strip()
+        if not storage_key or not settings.uses_s3_storage:
+            updated_documents.append(document)
+            continue
+
+        archive_name = sanitize_filename(
+            (document.get("filename") or "").strip() or Path(storage_key).name or "attachment.zip"
+        )
+        archive_path = unique_path(raw_dir / archive_name)
+        source_url = (document.get("source_url") or document.get("url") or "").strip()
+
+        try:
+            download_stored_file(storage_key=storage_key, target_path=archive_path)
+            extracted_docs = _extract_zip_documents(
+                archive_path=archive_path,
+                raw_dir=raw_dir,
+                source=source,
+                tender_id=tender_id,
+                source_url=source_url,
+            )
+        except Exception as exc:
+            logger.warning("Poptavej ZIP backfill failed for %s: %s", storage_key, exc)
+            updated_documents.append(document)
+            continue
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+        if not extracted_docs:
+            updated_documents.append(document)
+            continue
+
+        updated_documents.extend(extracted_docs)
+        documents_uploaded += len(extracted_docs)
+        archives_expanded += 1
+        storage_keys_to_delete.append(storage_key)
+        changed = True
+
+    if not changed:
+        return {
+            "archives_expanded": 0,
+            "documents_uploaded": 0,
+        }
+
+    meta["documents"] = updated_documents
+    upsert_tender_meta(meta)
+
+    for storage_key in storage_keys_to_delete:
+        try:
+            delete_stored_file(storage_key=storage_key)
+        except Exception as exc:
+            logger.warning("Poptavej ZIP delete failed for %s: %s", storage_key, exc)
+
+    return {
+        "archives_expanded": archives_expanded,
+        "documents_uploaded": documents_uploaded,
+    }
+
+
 def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) -> None:
     notice_url = meta.get("notice_url")
     if not notice_url:
@@ -186,44 +371,29 @@ def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) ->
             if not attachments:
                 return
 
-            if len(docs_meta) == 0:
-                for attachment in attachments:
-                    docs_meta.append(
-                        {
-                            "url": attachment.url,
-                            "filename": attachment.filename,
-                            "mime_type": None,
-                            "storage_key": None,
-                            "storage_url": None,
-                            "size_bytes": None,
-                            "sha256": None,
-                            "downloaded_at": None,
-                        }
-                    )
-
-            attachments_by_name: Dict[str, _Attachment] = {attachment.filename: attachment for attachment in attachments}
-
-            def pick_attachment_for_doc(document: Dict[str, Any], idx: int) -> Optional[_Attachment]:
-                filename = (document.get("filename") or "").strip()
-                if filename:
-                    placeholder = _parse_placeholder_index(filename)
-                    if placeholder is not None:
-                        j = placeholder - 1
-                        if 0 <= j < len(attachments):
-                            return attachments[j]
-                    if filename in attachments_by_name:
-                        return attachments_by_name[filename]
-                if 0 <= idx < len(attachments):
-                    return attachments[idx]
-                return None
-
-            for i, document in enumerate(docs_meta):
+            docs_by_source_url: Dict[str, List[Dict[str, Any]]] = {}
+            docs_by_filename: Dict[str, List[Dict[str, Any]]] = {}
+            for document in docs_meta:
                 _normalize_document_urls(document)
-                if document.get("storage_key") and document.get("sha256"):
-                    continue
+                source_url = (document.get("source_url") or document.get("url") or "").strip()
+                filename = (document.get("filename") or "").strip()
+                if source_url:
+                    docs_by_source_url.setdefault(source_url, []).append(document)
+                if filename:
+                    docs_by_filename.setdefault(filename, []).append(document)
 
-                attachment = pick_attachment_for_doc(document, i)
-                if not attachment:
+            used_document_ids: set[int] = set()
+            updated_documents: List[Dict[str, Any]] = []
+
+            for i, attachment in enumerate(attachments):
+                existing_documents = docs_by_source_url.get(attachment.url) or docs_by_filename.get(attachment.filename) or []
+                existing_documents = [document for document in existing_documents if id(document) not in used_document_ids]
+                if not existing_documents and 0 <= i < len(docs_meta) and id(docs_meta[i]) not in used_document_ids:
+                    existing_documents = [docs_meta[i]]
+
+                if existing_documents and all(_document_has_stored_payload(document) for document in existing_documents):
+                    updated_documents.extend(existing_documents)
+                    used_document_ids.update(id(document) for document in existing_documents)
                     continue
 
                 server_name = sanitize_filename(attachment.filename)
@@ -243,8 +413,9 @@ def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) ->
                         target_path=tmp,
                     )
                 except Exception:
-                    document["url"] = attachment.url
                     tmp.unlink(missing_ok=True)
+                    updated_documents.extend(existing_documents)
+                    used_document_ids.update(id(document) for document in existing_documents)
                     continue
 
                 try:
@@ -258,29 +429,27 @@ def download_poptavej_docs(*, meta: Dict[str, Any], timeout_ms: int = 60_000) ->
                             dst.write(chunk)
                     tmp.unlink(missing_ok=True)
 
-                size_bytes = target.stat().st_size
-                sha = sha256_file(target)
                 mime = headers.get("content-type") or guess_mime_type(target.name)
-                stored = persist_downloaded_file(
+                uploaded_documents = _persist_downloaded_attachment(
                     file_path=target,
+                    raw_dir=raw_dir,
                     source=source,
                     tender_id=tender_id,
+                    source_url=attachment.url,
+                    filename=attachment.filename,
+                    mime_type=mime,
                 )
 
-                document["source_url"] = attachment.url
-                document["url"] = attachment.url
-                document["filename"] = attachment.filename
-                document["storage_key"] = stored.storage_key
-                document["storage_url"] = stored.storage_url or (
-                    settings.public_object_url(stored.storage_key) if stored.storage_key else None
-                )
-                document["download_url"] = document.get("storage_url")
-                document["size_bytes"] = int(size_bytes)
-                document["sha256"] = sha
-                document["mime_type"] = mime
-                document["downloaded_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
+                updated_documents.extend(uploaded_documents)
+                used_document_ids.update(id(document) for document in existing_documents)
                 page.wait_for_timeout(250)
+
+            for document in docs_meta:
+                if id(document) in used_document_ids:
+                    continue
+                updated_documents.append(document)
+
+            meta["documents"] = updated_documents
 
         finally:
             try:

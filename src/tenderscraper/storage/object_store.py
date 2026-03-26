@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+
 import boto3
 from botocore.client import Config
 
@@ -48,6 +49,23 @@ def persist_downloaded_file(
     public_url = settings.public_object_url(key)
     file_path.unlink(missing_ok=True)
     return StoredDocument(storage_key=key, storage_url=public_url)
+
+
+def download_stored_file(*, storage_key: str, target_path: Path) -> None:
+    if not settings.uses_s3_storage:
+        raise ValueError("download_stored_file is only available when STORAGE_BACKEND=s3")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    client = _s3_client()
+    client.download_file(settings.s3_bucket, storage_key, str(target_path))
+
+
+def delete_stored_file(*, storage_key: str) -> None:
+    if not settings.uses_s3_storage:
+        return
+
+    client = _s3_client()
+    client.delete_object(Bucket=settings.s3_bucket, Key=storage_key)
 
 
 def generate_download_url(storage_key: str) -> str:
