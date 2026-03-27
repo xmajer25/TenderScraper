@@ -260,3 +260,30 @@ def get_winner_tender_count(*, winner: str, source: str | None = "poptavej") -> 
             "winner_ic": row[2],
             "tender_count": int(row[3]),
         }
+
+
+def list_tenders_for_winner(
+    *,
+    winner: str,
+    source: str | None = "poptavej",
+    offset: int = 0,
+    limit: int = 50,
+) -> tuple[int, List[Dict[str, Any]]]:
+    winner = winner.strip()
+    if not winner:
+        return 0, []
+
+    winner_key = _winner_key_expr()
+
+    with session_scope() as db:
+        statement = select(TenderRecord).where(winner_key == winner)
+        count_statement = select(func.count()).select_from(TenderRecord).where(winner_key == winner)
+
+        if source:
+            statement = statement.where(TenderRecord.source == source)
+            count_statement = count_statement.where(TenderRecord.source == source)
+
+        statement = statement.order_by(TenderRecord.ingested_at.desc()).offset(offset).limit(limit)
+        total = int(db.exec(count_statement).one() or 0)
+        items = [dict(record.meta_json) for record in db.exec(statement).all()]
+        return total, items

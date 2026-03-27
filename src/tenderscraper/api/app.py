@@ -9,6 +9,7 @@ from tenderscraper.config import settings
 from tenderscraper.db import create_db_and_tables, ping_database
 from tenderscraper.repository import get_tender_meta, get_winner_tender_count, list_distinct_winners
 from tenderscraper.repository import list_sources as repo_list_sources
+from tenderscraper.repository import list_tenders_for_winner
 from tenderscraper.repository import list_tenders as repo_list_tenders
 from tenderscraper.storage.object_store import generate_download_url
 
@@ -119,6 +120,7 @@ def root() -> dict:
             "get_tender": "/tenders/{source}/{tender_id}",
             "distinct_winners": "/distinct_winners",
             "winner_tender_count": "/distinct_winners/{winner}/tender_count",
+            "winner_tenders": "/distinct_winners/{winner}/tenders",
         },
     }
 
@@ -165,6 +167,37 @@ def winner_tender_count(
     if not payload:
         raise HTTPException(status_code=404, detail=f"Winner '{winner}' not found")
     return {"source": source, **payload}
+
+
+@app.get("/distinct_winners/{winner}/tenders")
+@app.get("/winners/{winner}/tenders")
+def winner_tenders(
+    winner: str,
+    source: Optional[str] = Query("poptavej", description="Filter by source key, defaults to poptavej"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+) -> Dict[str, Any]:
+    winner_payload = get_winner_tender_count(winner=winner, source=source)
+    if not winner_payload:
+        raise HTTPException(status_code=404, detail=f"Winner '{winner}' not found")
+
+    total, items = list_tenders_for_winner(winner=winner, source=source, offset=offset, limit=limit)
+    payload = [
+        {
+            **_summary(meta),
+            "id": meta.get("source_tender_id"),
+            "detail_endpoint": f"/tenders/{meta.get('source')}/{meta.get('source_tender_id')}",
+        }
+        for meta in items
+    ]
+    return {
+        "source": source,
+        **winner_payload,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "items": payload,
+    }
 
 
 @app.get("/tenders")
