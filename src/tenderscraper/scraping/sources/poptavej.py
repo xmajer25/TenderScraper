@@ -30,8 +30,11 @@ class ScrapedPoptavejDetail:
     source_tender_id: str
     notice_url: str
     title: str | None
+    original_url: str | None
     buyer_name: str | None
     buyer_ico: str | None
+    winner_name: str | None
+    winner_ic: str | None
     description_html: str | None
     description_text: str | None
     submission_deadline_at: datetime | None
@@ -61,6 +64,7 @@ class PoptavejScraper:
     _DETAIL_ATTACH_PUBLIC_SEL = "div.main-text a.prilohy span"
     _DETAIL_ATTACH_AUTH_SEL = "div.main-text a[target='_blank'][href*='/data/procurement/file/']"
     _DETAIL_CONTACT_ROW_SEL = "div.contact-area .contact .row"
+    _DETAIL_WINNER_ROW_SEL = "div.winner-area .contact .row"
     _DETAIL_CONTACT_TITLE_SEL = ".title"
     _DETAIL_CONTACT_VALUE_SEL = ".value"
     _DETAIL_DEADLINE_RE = re.compile(
@@ -229,7 +233,9 @@ class PoptavejScraper:
                         )
                     )
 
-                buyer_name, buyer_ico = self._extract_buyer_fields_from_pairs(contact_rows)
+                original_url = self._extract_original_url(page)
+                buyer_name, buyer_ico = self._extract_name_and_id_from_pairs(contact_rows)
+                winner_name, winner_ic = self._extract_winner_fields(page)
                 submission_deadline_raw = self._extract_submission_deadline_raw(page)
                 submission_deadline_at = self._parse_absolute_date(submission_deadline_raw)
 
@@ -237,8 +243,11 @@ class PoptavejScraper:
                     source_tender_id=source_tender_id,
                     notice_url=notice_url,
                     title=title,
+                    original_url=original_url,
                     buyer_name=buyer_name,
                     buyer_ico=buyer_ico,
+                    winner_name=winner_name,
+                    winner_ic=winner_ic,
                     description_html=desc_html,
                     description_text=desc_text,
                     submission_deadline_at=submission_deadline_at,
@@ -284,11 +293,32 @@ class PoptavejScraper:
         return match.group(1).strip() or None
 
     @classmethod
-    def _extract_buyer_fields_from_pairs(
+    def _extract_original_url(cls, page) -> str | None:
+        rows = page.locator(cls._DETAIL_CONTACT_ROW_SEL)
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            label = cls._normalize_label(cls._safe_text(row.locator(cls._DETAIL_CONTACT_TITLE_SEL).first))
+            if label != "url odkaz":
+                continue
+
+            link = row.locator("a[href]").first
+            if link.count() > 0:
+                href = (link.get_attribute("href") or "").strip()
+                if href:
+                    return href
+
+            value = cls._safe_text(row.locator(cls._DETAIL_CONTACT_VALUE_SEL).first)
+            if value and value.startswith(("http://", "https://")):
+                return value
+
+        return None
+
+    @classmethod
+    def _extract_name_and_id_from_pairs(
         cls, pairs: list[tuple[str | None, str | None]]
     ) -> tuple[str | None, str | None]:
-        buyer_name: str | None = None
-        buyer_ico: str | None = None
+        name: str | None = None
+        ico: str | None = None
 
         for raw_label, raw_value in pairs:
             label = cls._normalize_label(raw_label)
@@ -296,12 +326,27 @@ class PoptavejScraper:
             if not value:
                 continue
 
-            if label == "nazev" and buyer_name is None:
-                buyer_name = value
-            elif label in {"ic", "ico"} and buyer_ico is None:
-                buyer_ico = value
+            if label == "nazev" and name is None:
+                name = value
+            elif label in {"ic", "ico"} and ico is None:
+                ico = value
 
-        return buyer_name, buyer_ico
+        return name, ico
+
+    @classmethod
+    def _extract_winner_fields(cls, page) -> tuple[str | None, str | None]:
+        winner_rows: list[tuple[str | None, str | None]] = []
+        rows = page.locator(cls._DETAIL_WINNER_ROW_SEL)
+        for i in range(rows.count()):
+            row = rows.nth(i)
+            winner_rows.append(
+                (
+                    cls._safe_text(row.locator(cls._DETAIL_CONTACT_TITLE_SEL).first),
+                    cls._safe_text(row.locator(cls._DETAIL_CONTACT_VALUE_SEL).first),
+                )
+            )
+
+        return cls._extract_name_and_id_from_pairs(winner_rows)
 
     @staticmethod
     def _normalize_label(value: str | None) -> str:

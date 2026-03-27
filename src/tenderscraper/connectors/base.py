@@ -30,6 +30,9 @@ class TenderNotice(BaseModel):
 
     date: Optional[dt_date] = None
     price: Optional[str] = None
+    original_url: Optional[str] = None
+    winner_name: Optional[str] = None
+    winner_ic: Optional[str] = None
 
     buyer: Optional[str] = None
     buyer_ico: Optional[str] = None

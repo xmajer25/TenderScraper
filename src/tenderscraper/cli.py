@@ -204,6 +204,83 @@ def backfill_poptavej_date_price(
     typer.echo(f"missing_in_db: {missing_in_db}")
 
 
+@app.command("backfill-poptavej-original-url-winner")
+def backfill_poptavej_original_url_winner(
+    limit: int = typer.Option(
+        0,
+        min=0,
+        help="How many existing poptavej tenders to process. Use 0 for all stored poptavej tenders.",
+    ),
+) -> None:
+    """Refresh original_url, winner_name, and winner_ic for existing poptavej tenders from detail pages."""
+    from tenderscraper.scraping.auth.poptavej_auth import ensure_storage_state
+    from tenderscraper.scraping.sources.poptavej import PoptavejScraper
+
+    settings.ensure_dirs()
+    create_db_and_tables()
+
+    storage_state_path = None
+    if settings.poptavej_username and settings.poptavej_password:
+        storage_state_path = ensure_storage_state(
+            headless=True,
+            timeout_ms=30_000,
+            force_relogin=False,
+        )
+
+    tender_refs = list_tender_refs(source="poptavej", limit=None if limit == 0 else limit)
+    if not tender_refs:
+        typer.echo("No matching poptavej tenders found.")
+        raise typer.Exit(code=0)
+
+    scraper = PoptavejScraper()
+    processed_tenders = 0
+    updated_tenders = 0
+    failed_tenders = 0
+    missing_notice_url = 0
+    missing_original_url = 0
+    tenders_with_winner = 0
+
+    for source, tender_id in tender_refs:
+        meta = get_tender_meta(source, tender_id)
+        if not meta:
+            continue
+
+        notice_url = (meta.get("notice_url") or "").strip()
+        if not notice_url:
+            missing_notice_url += 1
+            continue
+
+        processed_tenders += 1
+        try:
+            detail = scraper.fetch_detail(
+                notice_url=notice_url,
+                storage_state_path=storage_state_path,
+                headless=True,
+                timeout_ms=30_000,
+            )
+        except Exception:
+            failed_tenders += 1
+            continue
+
+        meta["original_url"] = detail.original_url
+        meta["winner_name"] = detail.winner_name
+        meta["winner_ic"] = detail.winner_ic
+        upsert_tender_meta(meta)
+        updated_tenders += 1
+
+        if not detail.original_url:
+            missing_original_url += 1
+        if detail.winner_name or detail.winner_ic:
+            tenders_with_winner += 1
+
+    typer.echo(f"processed_tenders: {processed_tenders}")
+    typer.echo(f"updated_tenders: {updated_tenders}")
+    typer.echo(f"failed_tenders: {failed_tenders}")
+    typer.echo(f"missing_notice_url: {missing_notice_url}")
+    typer.echo(f"missing_original_url: {missing_original_url}")
+    typer.echo(f"tenders_with_winner: {tenders_with_winner}")
+
+
 @app.command("backfill-poptavej-zip-docs")
 def backfill_poptavej_zip_docs(
     limit: int = typer.Option(

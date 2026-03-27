@@ -34,6 +34,12 @@ def _ensure_tender_record_columns() -> None:
             alter_statements.append(f'ALTER TABLE {table_name} ADD COLUMN "date" DATE')
         if "price" not in existing_columns:
             alter_statements.append(f'ALTER TABLE {table_name} ADD COLUMN "price" TEXT')
+        if "original_url" not in existing_columns:
+            alter_statements.append(f'ALTER TABLE {table_name} ADD COLUMN "original_url" TEXT')
+        if "winner_name" not in existing_columns:
+            alter_statements.append(f'ALTER TABLE {table_name} ADD COLUMN "winner_name" TEXT')
+        if "winner_ic" not in existing_columns:
+            alter_statements.append(f'ALTER TABLE {table_name} ADD COLUMN "winner_ic" TEXT')
 
         for statement in alter_statements:
             try:
