@@ -10,6 +10,13 @@ from tenderscraper.db import create_db_and_tables, session_scope
 from tenderscraper.db_models import TenderRecord
 
 
+def _winner_key_expr():
+    return func.coalesce(
+        func.nullif(TenderRecord.winner_ic, ""),
+        func.nullif(TenderRecord.winner_name, ""),
+    )
+
+
 def _parse_datetime(value: Any) -> Optional[datetime]:
     if value is None or isinstance(value, datetime):
         return value
@@ -163,4 +170,93 @@ def get_db_stats() -> Dict[str, Any]:
             "documents_total": documents_total,
             "tenders_with_documents": tenders_with_documents,
             "by_source": dict(sorted(by_source.items())),
+        }
+
+
+def list_distinct_winners(
+    *,
+    source: str | None = "poptavej",
+    q: str | None = None,
+    offset: int = 0,
+    limit: int = 50,
+) -> tuple[int, List[Dict[str, Any]]]:
+    winner_key = _winner_key_expr()
+
+    with session_scope() as db:
+        statement = (
+            select(
+                winner_key.label("winner"),
+                func.max(func.nullif(TenderRecord.winner_name, "")).label("winner_name"),
+                func.max(func.nullif(TenderRecord.winner_ic, "")).label("winner_ic"),
+                func.count().label("tender_count"),
+            )
+            .where(winner_key.isnot(None))
+        )
+        count_statement = select(func.count(func.distinct(winner_key))).where(winner_key.isnot(None))
+
+        if source:
+            statement = statement.where(TenderRecord.source == source)
+            count_statement = count_statement.where(TenderRecord.source == source)
+
+        if q:
+            pattern = f"%{q.strip()}%"
+            predicate = or_(
+                TenderRecord.winner_name.ilike(pattern),
+                TenderRecord.winner_ic.ilike(pattern),
+            )
+            statement = statement.where(predicate)
+            count_statement = count_statement.where(predicate)
+
+        statement = (
+            statement.group_by(winner_key)
+            .order_by(func.count().desc(), winner_key.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+
+        total = int(db.exec(count_statement).one() or 0)
+        rows = db.exec(statement).all()
+        items = [
+            {
+                "winner": str(row[0]),
+                "winner_name": row[1],
+                "winner_ic": row[2],
+                "tender_count": int(row[3]),
+            }
+            for row in rows
+        ]
+        return total, items
+
+
+def get_winner_tender_count(*, winner: str, source: str | None = "poptavej") -> Optional[Dict[str, Any]]:
+    winner = winner.strip()
+    if not winner:
+        return None
+
+    winner_key = _winner_key_expr()
+
+    with session_scope() as db:
+        statement = (
+            select(
+                winner_key.label("winner"),
+                func.max(func.nullif(TenderRecord.winner_name, "")).label("winner_name"),
+                func.max(func.nullif(TenderRecord.winner_ic, "")).label("winner_ic"),
+                func.count().label("tender_count"),
+            )
+            .where(winner_key == winner)
+        )
+
+        if source:
+            statement = statement.where(TenderRecord.source == source)
+
+        statement = statement.group_by(winner_key)
+        row = db.exec(statement).one_or_none()
+        if row is None:
+            return None
+
+        return {
+            "winner": str(row[0]),
+            "winner_name": row[1],
+            "winner_ic": row[2],
+            "tender_count": int(row[3]),
         }

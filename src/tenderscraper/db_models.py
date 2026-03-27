@@ -18,8 +18,8 @@ class TenderRecord(SQLModel, table=True):
     date: Optional[dt_date] = None
     price: Optional[str] = None
     original_url: Optional[str] = None
-    winner_name: Optional[str] = None
-    winner_ic: Optional[str] = None
+    winner_name: Optional[str] = Field(default=None, index=True)
+    winner_ic: Optional[str] = Field(default=None, index=True)
     buyer: Optional[str] = None
     buyer_ico: Optional[str] = None
     description: Optional[str] = None

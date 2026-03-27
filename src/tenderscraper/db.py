@@ -28,7 +28,9 @@ def _ensure_tender_record_columns() -> None:
             return
 
         existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+        existing_indexes = {index["name"] for index in inspector.get_indexes(table_name)}
         alter_statements: list[str] = []
+        index_statements: list[str] = []
 
         if "date" not in existing_columns:
             alter_statements.append(f'ALTER TABLE {table_name} ADD COLUMN "date" DATE')
@@ -41,6 +43,11 @@ def _ensure_tender_record_columns() -> None:
         if "winner_ic" not in existing_columns:
             alter_statements.append(f'ALTER TABLE {table_name} ADD COLUMN "winner_ic" TEXT')
 
+        if "ix_tenderrecord_winner_ic" not in existing_indexes:
+            index_statements.append(f'CREATE INDEX IF NOT EXISTS ix_tenderrecord_winner_ic ON {table_name} ("winner_ic")')
+        if "ix_tenderrecord_winner_name" not in existing_indexes:
+            index_statements.append(f'CREATE INDEX IF NOT EXISTS ix_tenderrecord_winner_name ON {table_name} ("winner_name")')
+
         for statement in alter_statements:
             try:
                 conn.execute(text(statement))
@@ -48,6 +55,9 @@ def _ensure_tender_record_columns() -> None:
                 message = str(exc).lower()
                 if "already exists" not in message and "duplicate column" not in message:
                     raise
+
+        for statement in index_statements:
+            conn.execute(text(statement))
 
 
 def reset_db() -> None:

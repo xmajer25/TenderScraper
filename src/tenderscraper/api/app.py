@@ -7,7 +7,8 @@ from fastapi.responses import RedirectResponse
 
 from tenderscraper.config import settings
 from tenderscraper.db import create_db_and_tables, ping_database
-from tenderscraper.repository import get_tender_meta, list_sources as repo_list_sources
+from tenderscraper.repository import get_tender_meta, get_winner_tender_count, list_distinct_winners
+from tenderscraper.repository import list_sources as repo_list_sources
 from tenderscraper.repository import list_tenders as repo_list_tenders
 from tenderscraper.storage.object_store import generate_download_url
 
@@ -116,6 +117,8 @@ def root() -> dict:
             "list_all_tenders": "/tenders",
             "list_tenders_by_source": "/tenders/{source}",
             "get_tender": "/tenders/{source}/{tender_id}",
+            "distinct_winners": "/distinct_winners",
+            "winner_tender_count": "/distinct_winners/{winner}/tender_count",
         },
     }
 
@@ -132,6 +135,36 @@ def health() -> dict:
 @app.get("/sources")
 def list_sources() -> Dict[str, Any]:
     return {"sources": repo_list_sources()}
+
+
+@app.get("/distinct_winners")
+@app.get("/winners")
+def distinct_winners(
+    source: Optional[str] = Query("poptavej", description="Filter by source key, defaults to poptavej"),
+    q: Optional[str] = Query(None, description="Substring search in winner name or IC"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+) -> Dict[str, Any]:
+    total, items = list_distinct_winners(source=source, q=q, offset=offset, limit=limit)
+    return {
+        "source": source,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "items": items,
+    }
+
+
+@app.get("/distinct_winners/{winner}/tender_count")
+@app.get("/winners/{winner}/tender_count")
+def winner_tender_count(
+    winner: str,
+    source: Optional[str] = Query("poptavej", description="Filter by source key, defaults to poptavej"),
+) -> Dict[str, Any]:
+    payload = get_winner_tender_count(winner=winner, source=source)
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"Winner '{winner}' not found")
+    return {"source": source, **payload}
 
 
 @app.get("/tenders")
